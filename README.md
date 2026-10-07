@@ -56,6 +56,37 @@ and back up anything you want to keep. This is a development preview, not a
 production deployment. Creating the Codespace requires your GitHub account;
 the configuration does not provision one automatically.
 
+### If the forwarded page shows HTTP 401
+
+The app's home page does not require a login. A browser error page showing
+**HTTP 401** at the forwarded root URL usually means GitHub's private-port
+authentication rejected the browser, not that you need an app account.
+
+1. Open the Codespace in a browser signed into the GitHub account that owns it,
+   then use **Ports → 8000 → Open in Browser** in that same browser profile.
+   A copied URL in another browser, account, or private window may not have the
+   required GitHub session.
+2. Keep port visibility **Private** and its **Port Protocol** set to **HTTP**:
+   the Python server speaks HTTP inside the container; GitHub supplies HTTPS
+   for the external browser URL.
+3. If it still fails, sign into GitHub again and reopen the port from the Ports
+   tab. Check whether browser privacy settings or extensions block the GitHub
+   authentication flow. Do not paste access tokens into URLs or share them.
+4. In the Codespace terminal, check the server separately from GitHub's gateway:
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/
+   ```
+
+   Expect **200** without an app login. If the connection fails, inspect
+   `/tmp/hyrox-coach.log`, then stop/start the Codespace. If it predates the
+   dev-container configuration, pull this branch's changes and run
+   **Codespaces: Rebuild Container** from the command palette.
+
+Do not make the port public to bypass authentication: that exposes this unfinished
+preview to anyone with its URL. See GitHub's
+[port-forwarding documentation](https://docs.github.com/en/codespaces/developing-in-a-codespace/forwarding-ports-in-your-codespace).
+
 ## Features
 
 - Signup/login/logout and one-use, expiring password reset.
@@ -102,6 +133,40 @@ When deploying changes to frontend assets, update `SHELL_CACHE` in
 never add authenticated API URLs to that cache.
 
 ## Deployment and password reset
+
+### Lowest-cost hosting choices
+
+[GitHub Pages](https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages)
+hosts static HTML/CSS/JavaScript only. It cannot run this app's Python API,
+authentication, coaching engine, or SQLite database. Publishing `static/` alone
+would not produce a working app. A Pages-only, device-local app would require a
+different architecture and would lose the current shared-team backend.
+
+- **No hosting bill:** run locally on an existing computer for testing. This is
+  not an always-on internet deployment. Codespaces is also a preview, with
+  account quotas and possible usage charges.
+- **Potential $0 internet hosting:** an
+  [Oracle Cloud Always Free VM](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier.htm)
+  can run Python and persistent storage within its free allowances. Availability,
+  account eligibility, and idle-instance reclamation make it a conditional
+  option, not a guaranteed always-on service. You must maintain the VM, HTTPS,
+  security updates, and off-server backups; avoid chargeable resources.
+- **Low-maintenance paid option:** a Render Starter web service with a 1 GB
+  persistent disk has an indicative base cost of **US$7.25/month**
+  ($7 compute + $0.25 storage). Confirm
+  [current pricing](https://render.com/pricing), taxes, and usage charges before
+  purchase. A provider subdomain avoids buying a domain. Render's free service
+  has no persistent disk and is unsuitable for keeping this SQLite database
+  across restarts/deployments; see
+  [persistent disks](https://render.com/docs/disks).
+
+For the lowest cash cost, try the free VM only if you accept its maintenance and
+availability limitations. For easier operation, budget for the paid managed
+service rather than risking training data on ephemeral storage. Neither is
+provisioned by this repository. Provider account setup and any charges require
+your approval. Finish the outstanding app review fixes and security/end-to-end
+checks before deploying real data. Keep a single app instance with persistent
+SQLite storage and tested backups whichever host you choose.
 
 Run behind a TLS-terminating reverse proxy. The included Python HTTP server is
 appropriate for this small private team, **not** a hardened public edge server.
