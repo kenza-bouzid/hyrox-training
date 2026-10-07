@@ -26,6 +26,7 @@
     return text.split(':').map(Number).reduce((total, part) => total * 60 + part, 0);
   };
   const titleCase = value => String(value ?? '').replace(/[_-]/g, ' ').replace(/\b\w/g, character => character.toUpperCase());
+  const resetToken = () => new URLSearchParams(location.search).get('token') || new URLSearchParams(location.search).get('reset');
   const words = value => {
     if (value == null) return '';
     if (typeof value === 'string' || typeof value === 'number') return String(value);
@@ -61,6 +62,10 @@
   let syncPromise;
   let toastTimer;
   let worker;
+  const withPrivateLock = operation => navigator.locks?.request ? navigator.locks.request('pair-private-sync', operation) : operation();
+  function invalidateOtherTabs() {
+    try { localStorage.setItem('pair-account-event', `${Date.now()}:${Math.random()}`); } catch { /* The server still rejects invalidated sessions when storage events are unavailable. */ }
+  }
   try { state.theme = localStorage.getItem('pair-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); } catch { /* Storage can be unavailable in private browsing. */ }
   document.documentElement.dataset.theme = state.theme;
 
@@ -104,19 +109,25 @@
     await store('put', 'private', { key: `dashboard:${state.session.user.id}`, value: data, savedAt: new Date().toISOString() });
   }
   async function loadQueue() {
-    try { state.queue = (await store('all', 'queue')).filter(item => String(item.user_id) === String(state.session?.user.id)); }
+    try {
+      state.queue = (await store('all', 'queue')).filter(item => String(item.user_id) === String(state.session?.user.id));
+      const failure = await store('get', 'private', `sync_error:${state.session?.user.id}`);
+      if (failure?.value && !state.syncError) state.syncError = failure.value;
+    }
     catch { state.queue = []; }
   }
   async function api(path, method = 'GET', payload, token = state.session?.csrf_token) {
     if (method !== 'GET' && !navigator.onLine) throw new Error('You’re offline. This change needs a connection. Workout logs can still be saved on this device.');
     let response;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
     try {
-      response = await fetch(path, { method, credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json', ...(payload !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(method !== 'GET' && token ? { 'X-CSRF-Token': token } : {}) }, ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}) });
+      response = await fetch(path, { method, signal: controller.signal, credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json', ...(payload !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(method !== 'GET' && token ? { 'X-CSRF-Token': token } : {}) }, ...(payload !== undefined ? { body: JSON.stringify(payload) } : {}) });
     } catch {
       const error = new Error('Cannot reach the server. Check your connection and try again.');
       error.network = true;
       throw error;
-    }
+    } finally { clearTimeout(timeout); }
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
       const error = new Error(typeof data.error === 'string' ? data.error : data.error?.message || data.message || `Request failed (${response.status}). Please try again.`);
@@ -142,16 +153,18 @@
     state.offline = false;
     try { await cacheSession(session); } catch { notify('Offline storage unavailable. Keep this app online to use your plan.'); }
     const dashboard = await api('/api/dashboard');
+    if (dashboard.user && String(dashboard.user.id) !== String(session.user.id)) throw new Error('Account changed while loading. Reload to securely open your training data.');
     state.dashboard = dashboard;
     try { await cacheDashboard(dashboard); } catch { /* Online data remains usable without device storage. */ }
     await loadQueue();
   }
   async function init() {
+    if (resetToken()) { state.authMode = 'confirm'; renderAuth(); setupWorker(); return; }
     try {
       state.session = await api('/api/session');
       await refresh();
       render();
-      await syncQueue();
+      if (state.queue.length) await syncQueue();
     } catch (error) {
       if (error.status === 401) {
         state.session = null;
@@ -183,9 +196,10 @@
     try {
       worker = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
       navigator.serviceWorker.addEventListener('message', async event => {
-        if (event.data?.type !== 'QUEUE_CHANGED' || !state.session) return;
+        if (event.data?.type !== 'QUEUE_CHANGED' || !state.session || String(event.data.userId) !== String(state.session.user.id)) return;
         await loadQueue();
-        try { await refresh(); state.syncError = ''; } catch (error) { state.syncError = error.message; }
+        if (event.data.error) state.syncError = event.data.error;
+        else try { await refresh(); state.syncError = ''; } catch (error) { state.syncError = error.message; }
         render();
       });
     } catch { /* Manual sync and IndexedDB work without service workers. */ }
@@ -193,27 +207,36 @@
   async function syncQueue() {
     if (syncPromise) return syncPromise;
     if (!state.session || !navigator.onLine) return;
-    syncPromise = (async () => {
+    const userId = String(state.session.user.id);
+    syncPromise = withPrivateLock(async () => {
       try {
+        if (String(state.session?.user.id) !== userId) throw new Error('Account changed. Your queued workouts are retained for the original account.');
         const session = await api('/api/session');
-        if (String(session.user.id) !== String(state.session.user.id)) throw new Error('Account changed. Your queued workouts are retained for the original account.');
+        if (String(session.user.id) !== userId) throw new Error('Account changed. Your queued workouts are retained for the original account.');
         state.session = session;
         await cacheSession(session);
         await loadQueue();
         for (const item of state.queue.sort((a, b) => a.created_at.localeCompare(b.created_at))) {
-          await api('/api/workouts/log', 'POST', item.payload, session.csrf_token);
+          if (String(state.session?.user.id) !== userId) throw new Error('Account changed; remaining workouts are retained.');
+          if (!await store('get', 'queue', item.client_id)) continue;
+          const result = await api('/api/workouts/log', 'POST', item.payload, session.csrf_token);
+          const confirmed = result.log || { ...item.payload, id: item.client_id };
+          state.dashboard = { ...state.dashboard, logs: [...arr(state.dashboard.logs).filter(log => log.date !== confirmed.date), confirmed].sort((a, b) => a.date.localeCompare(b.date)) };
+          await cacheDashboard(state.dashboard);
           await store('delete', 'queue', item.client_id);
         }
         state.syncError = '';
+        await store('put', 'private', { key: `sync_error:${session.user.id}`, value: '' });
         await refresh();
       } catch (error) {
         state.syncError = error.status === 401 ? 'Session expired. Sign in again to sync. Your saved workouts are retained.' : error.message;
+        try { if (String(state.session?.user.id) === userId) await store('put', 'private', { key: `sync_error:${userId}`, value: state.syncError }); } catch { /* Keep the failure visible even if storage is full. */ }
         if (error.network) state.offline = true;
       } finally {
         await loadQueue();
         if (state.session && state.dashboard) render();
       }
-    })();
+    });
     try { await syncPromise; } finally { syncPromise = null; }
   }
   async function queueWorkout(payload) {
@@ -237,7 +260,9 @@
   const navItems = [['home', 'Home'], ['plan', 'Plan'], ['workout', 'Workout'], ['progress', 'Progress'], ['team', 'Team'], ['coach', 'Coach']];
   function route() {
     const [page, id] = location.hash.replace(/^#\/?/, '').split('/');
-    return { page: page || 'home', id: id ? decodeURIComponent(id) : null };
+    let decoded;
+    try { decoded = id ? decodeURIComponent(id) : null; } catch { decoded = null; }
+    return { page: page || 'home', id: decoded };
   }
   function link(page, label, symbol = 'arrow', classes = 'text-button') { return `<a class="${classes}" href="#/${page}">${esc(label)} ${icon(symbol)}</a>`; }
   function heading(eyebrow, title, description, action = '') {
@@ -257,13 +282,13 @@
   }
   function renderAuth(message = '') {
     const mode = state.authMode;
-    const resetToken = new URLSearchParams(location.search).get('token');
-    if (resetToken) state.authMode = 'confirm';
-    const actualMode = resetToken ? 'confirm' : mode;
+    const token = resetToken();
+    if (token) state.authMode = 'confirm';
+    const actualMode = token ? 'confirm' : mode;
     const isSignup = actualMode === 'signup';
     const isReset = actualMode === 'reset';
     const isConfirm = actualMode === 'confirm';
-    $('#app').innerHTML = `<main id="main" class="auth-layout"><section class="auth-story"><a href="/" class="brand"><span class="brand-mark">P<span>↗</span></span>PAIR</a><div><div class="eyebrow" style="color:#c4d5c9">YOUR HYROX DOUBLES JOURNEY</div><h1>Better training.<br><em>Together.</em></h1><p>A plan that works around your life. A partner by your side. Eight stations. One finish line.</p><div class="row" style="margin-top:30px"><span class="tag dark">BUILT FOR KENZA + ROB</span><span class="tag dark">8 KM · 8 STATIONS</span></div></div><footer>Consistency beats perfection. Let’s build yours.</footer></section><section class="auth-form-side"><div class="auth-form-inner"><a href="/" class="brand auth-mobile-brand"><span class="brand-mark">P<span>↗</span></span>PAIR</a>${!isReset && !isConfirm ? `<div class="auth-tabs" aria-label="Account access"><button data-action="auth-login" class="${!isSignup ? 'active' : ''}">Sign in</button><button data-action="auth-signup" class="${isSignup ? 'active' : ''}">Create account</button></div>` : ''}<h2>${isConfirm ? 'Choose a new password.' : isReset ? 'Let’s get you back in.' : isSignup ? 'Your next chapter starts here.' : 'Welcome back.'}</h2><p class="subtitle">${isConfirm ? 'Use at least 10 characters for your new password.' : isReset ? 'Enter your email to request a password reset.' : isSignup ? 'Create your personal account, then connect with your partner.' : 'A little stronger. A little closer. Let’s get to work.'}</p>${message ? `<div class="notice warning">${esc(message)}</div>` : ''}<form id="auth-form" data-mode="${esc(actualMode)}">${!isConfirm ? field('email', 'Email address', 'email', '', { required: true, autocomplete: 'email', placeholder: 'you@example.com' }) : ''}${!isReset ? field('password', isConfirm ? 'New password' : 'Password', 'password', '', { required: true, minlength: isSignup || isConfirm ? 10 : 1, autocomplete: isSignup || isConfirm ? 'new-password' : 'current-password', placeholder: 'Your password' }) : ''}${isSignup ? `<div class="form-grid">${selectField('person', 'I am', ['Kenza', 'Rob'], 'Kenza')}${field('invite_code', 'Team invite code', 'text', '', { placeholder: 'Optional', maxlength: 40 })}</div><p class="small muted">Have a partner already on PAIR? Use their invite code to share race settings, simulations and station data.</p>` : ''}<button class="btn full" type="submit">${isConfirm ? 'Update password' : isReset ? 'Request password reset' : isSignup ? 'Create my training space' : 'Sign in'} ${icon('arrow')}</button><p class="form-error" role="alert"></p></form>${!isSignup && !isConfirm ? `<button class="text-button" data-action="${isReset ? 'auth-login' : 'auth-reset'}">${isReset ? 'Back to sign in' : 'Forgot your password?'}</button>` : ''}<p class="auth-fine">Your baseline and race projection are separate. Progress starts with real training data, not promises. Not affiliated with HYROX.</p></div></section></main>`;
+    $('#app').innerHTML = `<main id="main" class="auth-layout"><section class="auth-story"><a href="/" class="brand"><span class="brand-mark">P<span>↗</span></span>PAIR</a><div><div class="eyebrow">YOUR HYROX DOUBLES JOURNEY</div><h1>Better training.<br><em>Together.</em></h1><p>A plan that works around your life. A partner by your side. Eight stations. One finish line.</p><div class="row section"><span class="tag dark">BUILT FOR KENZA + ROB</span><span class="tag dark">8 KM · 8 STATIONS</span></div></div><footer>Consistency beats perfection. Let’s build yours.</footer></section><section class="auth-form-side"><div class="auth-form-inner"><a href="/" class="brand auth-mobile-brand"><span class="brand-mark">P<span>↗</span></span>PAIR</a>${!isReset && !isConfirm ? `<div class="auth-tabs" aria-label="Account access"><button data-action="auth-login" class="${!isSignup ? 'active' : ''}">Sign in</button><button data-action="auth-signup" class="${isSignup ? 'active' : ''}">Create account</button></div>` : ''}<h2>${isConfirm ? 'Choose a new password.' : isReset ? 'Let’s get you back in.' : isSignup ? 'Your next chapter starts here.' : 'Welcome back.'}</h2><p class="subtitle">${isConfirm ? 'Use at least 10 characters for your new password.' : isReset ? 'Enter your email to request a password reset.' : isSignup ? 'Create your personal account, then connect with your partner.' : 'A little stronger. A little closer. Let’s get to work.'}</p>${message ? `<div class="notice warning">${esc(message)}</div>` : ''}<form id="auth-form" data-mode="${esc(actualMode)}">${!isConfirm ? field('email', 'Email address', 'email', '', { required: true, autocomplete: 'email', placeholder: 'you@example.com' }) : ''}${!isReset ? field('password', isConfirm ? 'New password' : 'Password', 'password', '', { required: true, minlength: isSignup || isConfirm ? 10 : 1, autocomplete: isSignup || isConfirm ? 'new-password' : 'current-password', placeholder: 'Your password' }) : ''}${isSignup ? `<div class="form-grid">${selectField('person', 'I am', ['Kenza', 'Rob'], 'Kenza')}${field('invite_code', 'Team invite code', 'text', '', { placeholder: 'Optional', maxlength: 40 })}</div><p class="small muted">Have a partner already on PAIR? Use their invite code to share race settings, simulations and station data.</p>` : ''}<button class="btn full" type="submit">${isConfirm ? 'Update password' : isReset ? 'Request password reset' : isSignup ? 'Create my training space' : 'Sign in'} ${icon('arrow')}</button><p class="form-error" role="alert"></p></form>${!isSignup && !isConfirm ? `<button class="text-button" data-action="${isReset ? 'auth-login' : 'auth-reset'}">${isReset ? 'Back to sign in' : 'Forgot your password?'}</button>` : ''}<p class="auth-fine">Your baseline and race projection are separate. Progress starts with real training data, not promises. Not affiliated with HYROX.</p></div></section></main>`;
   }
   function renderHome() {
     const workout = currentWorkout();
@@ -273,8 +298,12 @@
     const weekLogs = logs().filter(log => log.date >= addDays(today(), -6) && ['completed', 'modified'].includes(log.status));
     const projection = state.dashboard.projection;
     const projected = num(projection?.seconds ?? projection?.projected_seconds ?? projection?.total_seconds);
-    const readiness = state.dashboard.readiness || {};
-    const score = num(readiness.score);
+    const readiness = { ...(state.dashboard.readiness || {}) };
+    const score = Object.keys(state.dashboard.checkin || {}).length || logs().some(log => ['sleep', 'soreness', 'fatigue', 'pain', 'energy'].some(key => num(log[key]) !== null)) ? num(readiness.score) : null;
+    if (score !== null) {
+      readiness.label ||= { green: 'Ready for the planned work', yellow: 'Keep the effort controlled', orange: 'Take a lighter approach', red: 'Rest & reassess today' }[readiness.color];
+      readiness.message ||= arr(readiness.reasons).join(' ');
+    }
     return `${heading('YOUR DAILY STARTING LINE', `Let’s move forward, ${person()}.`, 'Small steps. Shared ambition. Your doubles journey, one session at a time.')}<div class="grid cols-2"><article class="card hero"><div class="row between"><div class="eyebrow">YOUR NEXT SESSION</div><span class="tag dark">${workout ? esc(titleCase(workout.intensity || workout.type)) : 'YOUR PLAN'}</span></div><h2>${esc(workout?.title || 'Your training starts here.')}</h2><p>${esc(workout?.objective || 'Set your race date and goals to build a plan around you and your partner.')}</p><div class="hero-footer"><div class="row small">${icon('clock')} ${workout ? `${esc(workout.duration)} min <span aria-hidden="true">·</span> ${esc(dateLabel(workout.date, { weekday: 'short', day: 'numeric', month: 'short' }))}` : 'Ready when you are'}</div>${link(workout ? `workout/${encodeURIComponent(workout.id || workout.date)}` : 'settings', workout ? isCompleted(workout.date) ? 'Review session' : 'View workout' : 'Set up your race', 'arrow', 'btn lime')}</div></article><article class="card"><div class="card-header"><h2>How are you arriving today?</h2>${icon('heart')}</div><div class="readiness-score"><div class="readiness-ring"><b>${score === null ? '—' : esc(Math.round(score))}</b><span>${score === null ? 'NO CHECK-IN' : 'READINESS'}</span></div><div class="readiness-copy"><strong>${esc(readiness.label || readiness.status || 'Check in with yourself')}</strong><p>${esc(readiness.message || readiness.summary || 'Sleep, soreness and fatigue help shape today’s training.')}</p></div></div><button class="btn secondary full" data-action="readiness">${state.dashboard.checkin ? 'Update daily check-in' : 'Complete daily check-in'} ${icon('arrow')}</button></article></div><div class="grid cols-4 stats">${stat('Race countdown', countdown === null ? '—' : `${countdown} days`, r.name || 'Set your race date', 'flag')}${stat('Your target', num(r.target_seconds) === null ? '—' : time(r.target_seconds), 'A goal, not a prediction', 'clock')}${stat('Current projection', projected === null ? '—' : time(projected), projected === null ? 'Needs measured training data' : 'Estimate · not a guaranteed result', 'progress')}${stat('Sessions this week', new Set(weekLogs.map(log => log.date)).size, 'Completed in the last 7 days', 'check')}</div><div class="grid cols-2"><section class="card"><div class="card-header"><h2>Your next seven days</h2>${link('plan', 'Full plan')}</div>${weekPlan.length ? weekPlan.slice(0, 5).map(workoutRow).join('') : empty('Your schedule is taking shape', 'Set your race and plan start dates in settings.', 'plan')}</section><section class="card"><div class="card-header"><h2>The bigger picture</h2><span class="tag">DOUBLES</span></div><p class="small muted">You both run all eight 1 km legs together. You can share station work; you cannot divide the running.</p><div class="divider"></div><div class="metric-row"><span>Starting baseline</span><b>${esc(num(r.baseline_seconds) === null ? 'Not recorded' : time(r.baseline_seconds))}</b></div><p class="small muted">Your starting reference stays separate from the current projection. Measured simulations make the estimate more useful.</p><div class="divider"></div>${link('team', 'Build your race partnership', 'team')}${link('simulations', 'Log a simulation', 'arrow')}</section></div>${renderAdjustments()}`;
   }
   function workoutRow(workout) {
@@ -331,7 +360,7 @@
     const t = team();
     const members = arr(t.members);
     const strategy = state.dashboard.strategy;
-    return `${heading('ONE FINISH LINE. TWO ATHLETES.', 'Your strongest partnership.', 'Share the work. Keep the rhythm. Get to the finish line together.')}<div class="grid cols-2"><section class="card"><div class="card-header"><h2>${esc(t.name || 'Kenza + Rob')}</h2><button class="text-button" data-action="team-name">Edit name</button></div>${members.length ? members.map((member, index) => `<div class="team-member"><span class="avatar${index ? ' alt' : ''}">${esc(String(member.person || member.name || 'A').slice(0, 1))}</span><div><h3>${esc(member.person || member.name || 'Athlete')}</h3><p class="small muted">${esc(member.email || 'Team member')}</p></div>${String(member.id) === String(state.session.user.id) ? '<span class="tag" style="margin-left:auto">YOU</span>' : ''}</div>`).join('') : `<div class="team-member"><span class="avatar">${esc(person().slice(0, 1))}</span><div><h3>${esc(person())}</h3><p class="small muted">Signed-in athlete</p></div><span class="tag" style="margin-left:auto">YOU</span></div><p class="small muted section">Invite your partner to connect their own account. Station measurements can cover both athletes even before they join.</p>`}<div class="notice section"><strong>Both athletes run the full 8 km.</strong><br>Each 1 km leg is completed together. Split station work to suit your strengths, and practise handovers.</div></section><section class="card"><div class="card-header"><h2>Bring your partner in</h2>${icon('team')}</div><p class="small muted">Your partner creates their own account and enters this invite code. Shared team data stays connected; personal logs stay with each athlete.</p>${t.invite_code ? `<div class="invite-code">${esc(t.invite_code)}</div><button class="btn secondary full" data-action="copy-invite">${icon('copy')} Copy invite code</button>` : '<div class="notice section">No invite code is available yet. Connect to refresh your team details.</div>'}</section></div><section class="card section"><div class="card-header"><h2>Make the handover your advantage.</h2><span class="tag">RACE STRATEGY</span></div>${strategy ? renderInsights(strategy) : '<p class="small muted">Record station times and fatigue for both athletes to build an evidence-based allocation. Don’t assume a 50/50 split is fastest.</p>'}<div class="form-actions">${link('stations', 'Measure your stations', 'workout', 'btn secondary')}${link('simulations', 'Practise your race', 'flag', 'btn outline')}</div></section>`;
+    return `${heading('ONE FINISH LINE. TWO ATHLETES.', 'Your strongest partnership.', 'Share the work. Keep the rhythm. Get to the finish line together.')}<div class="grid cols-2"><section class="card"><div class="card-header"><h2>${esc(t.name || 'Kenza + Rob')}</h2><button class="text-button" data-action="team-name">Edit name</button></div>${members.length ? members.map((member, index) => `<div class="team-member"><span class="avatar${index ? ' alt' : ''}">${esc(String(member.person || member.name || 'A').slice(0, 1))}</span><div><h3>${esc(member.person || member.name || 'Athlete')}</h3><p class="small muted">${esc(member.email || 'Team member')}</p></div>${String(member.id) === String(state.session.user.id) ? '<span class="tag push-right">YOU</span>' : ''}</div>`).join('') : `<div class="team-member"><span class="avatar">${esc(person().slice(0, 1))}</span><div><h3>${esc(person())}</h3><p class="small muted">Signed-in athlete</p></div><span class="tag push-right">YOU</span></div><p class="small muted section">Invite your partner to connect their own account. Station measurements can cover both athletes even before they join.</p>`}<div class="notice section"><strong>Both athletes run the full 8 km.</strong><br>Each 1 km leg is completed together. Split station work to suit your strengths, and practise handovers.</div></section><section class="card"><div class="card-header"><h2>Bring your partner in</h2>${icon('team')}</div><p class="small muted">Your partner creates their own account and enters this invite code. Shared team data stays connected; personal logs stay with each athlete.</p>${t.invite_code ? `<div class="invite-code">${esc(t.invite_code)}</div><button class="btn secondary full" data-action="copy-invite">${icon('copy')} Copy invite code</button>` : '<div class="notice section">No invite code is available yet. Connect to refresh your team details.</div>'}</section></div><section class="card section"><div class="card-header"><h2>Make the handover your advantage.</h2><span class="tag">RACE STRATEGY</span></div>${Array.isArray(strategy) ? strategy.map(item => `<div class="station-row"><span class="pill-number">${icon('workout')}</span><div><h3>${esc(item.name || titleCase(item.station))}</h3><p>${esc(item.rationale)}</p></div><div class="station-share"><b>${item.kenza_share == null ? 'Unmeasured' : `${Math.round(item.kenza_share * 100)}% / ${100 - Math.round(item.kenza_share * 100)}%`}</b>${item.kenza_share == null ? 'No allocation guessed' : 'Kenza / Rob · estimate'}<br>${item.seconds == null ? '' : esc(time(item.seconds))}</div></div>`).join('') : strategy ? renderInsights(strategy) : '<p class="small muted">Record station times and fatigue for both athletes to build an evidence-based allocation. Don’t assume a 50/50 split is fastest.</p>'}<div class="form-actions">${link('stations', 'Measure your stations', 'workout', 'btn secondary')}${link('simulations', 'Practise your race', 'flag', 'btn outline')}</div></section>`;
   }
   function stations() {
     const data = state.dashboard.stations;
@@ -342,7 +371,7 @@
     const measurements = state.dashboard.measurements || {};
     return `${link('progress', 'Back to progress', 'back')}${heading('EIGHT STATIONS. FIND YOUR EDGE.', 'The work between the runs.', 'Measured station profiles help you divide work, not guess.', '<button class="btn outline" data-action="station-settings">Edit race standards</button>')}<div class="notice">Confirm station loads and distances against your event division’s official rules. Training recommendations never override event standards. Missing values mean <strong>not measured</strong>, not zero.</div><div class="grid equal-2">${stations().map(station => {
       const measured = measurements[station.id] || {};
-      return `<article class="card"><div class="card-header"><div class="row"><span class="pill-number">${String(station.index + 1).padStart(2, '0')}</span><h2>${esc(station.name)}</h2></div><button class="text-button" data-action="measure" data-station="${esc(station.id)}">Record data</button></div><p class="small muted">${esc(station.description || station.instructions || station.objective || 'Record full-station benchmarks in comparable conditions.')}</p><div class="metric-values">${['distance', 'distance_m', 'reps', 'load', 'load_kg', 'standard', 'technique'].filter(key => station[key] != null).map(key => `<span>${esc(titleCase(key))}: <b>${esc(words(station[key]))}</b></span>`).join('')}</div><div class="divider"></div><div class="grid equal-2"><div><div class="eyebrow">KENZA</div><h3>${esc(time(measured.kenza_seconds))}</h3><p class="small muted">Fatigue: ${esc(measured.kenza_fatigue ?? 'Not recorded')}${measured.kenza_fatigue != null ? '/10' : ''}</p></div><div><div class="eyebrow">ROB</div><h3>${esc(time(measured.rob_seconds))}</h3><p class="small muted">Fatigue: ${esc(measured.rob_fatigue ?? 'Not recorded')}${measured.rob_fatigue != null ? '/10' : ''}</p></div></div><div class="metric-row"><span>Transition time</span><b>${esc(time(measured.transition_seconds))}</b></div><div class="metric-row"><span>Preferred Kenza share</span><b>${esc(measured.preferred_share != null ? `${measured.preferred_share}%` : 'Not set')}</b></div></article>`;
+      return `<article class="card"><div class="card-header"><div class="row"><span class="pill-number">${String(station.index + 1).padStart(2, '0')}</span><h2>${esc(station.name)}</h2></div><button class="text-button" data-action="measure" data-station="${esc(station.id)}">Record data</button></div><p class="small muted">${esc(station.description || station.instructions || station.instruction || station.objective || 'Record full-station benchmarks in comparable conditions.')}</p><div class="metric-values">${station.distance != null ? `<span>Distance / reps: <b>${esc(station.distance)} ${esc(station.unit || '')}</b></span>` : ''}${station.load != null ? `<span>Load: <b>${esc(station.load)} ${esc(station.load_unit || 'kg')}</b></span>` : ''}${station.exercises ? `<span>Exercises: ${esc(words(station.exercises))}</span>` : ''}</div>${station.reference || station.notes ? `<p class="micro muted section">${esc(station.reference || '')} ${esc(station.notes || '')}</p>` : ''}<div class="divider"></div><div class="grid equal-2"><div><div class="eyebrow">KENZA</div><h3>${esc(time(measured.kenza_seconds))}</h3><p class="small muted">Fatigue: ${esc(measured.kenza_fatigue ?? 'Not recorded')}${measured.kenza_fatigue != null ? '/10' : ''}</p></div><div><div class="eyebrow">ROB</div><h3>${esc(time(measured.rob_seconds))}</h3><p class="small muted">Fatigue: ${esc(measured.rob_fatigue ?? 'Not recorded')}${measured.rob_fatigue != null ? '/10' : ''}</p></div></div><div class="metric-row"><span>Transition time</span><b>${esc(time(measured.transition_seconds))}</b></div><div class="metric-row"><span>Preferred Kenza share</span><b>${esc(measured.preferred_share != null ? `${Math.round(measured.preferred_share * 100)}%` : 'Not set')}</b></div></article>`;
     }).join('') || `<section class="card">${empty('No station profiles available', 'Connect to download your team’s station configuration.', 'workout')}</section>`}</div>`;
   }
   function renderSimulations() {
@@ -350,11 +379,28 @@
     return `${link('progress', 'Back to progress', 'back')}${heading('REHEARSE. REFINE. REPEAT.', 'Race day, before race day.', 'Keep measured simulations separate from hypothetical scenarios.', '<button class="btn outline" data-action="simulation">Log simulation</button>')}<div class="grid equal-2"><section class="card"><div class="card-header"><h2>Your race references</h2>${icon('flag')}</div><div class="metric-row"><span>Starting baseline</span><b>${esc(time(race().baseline_seconds))}</b></div><div class="metric-row"><span>Target</span><b>${esc(time(race().target_seconds))}</b></div><p class="small muted section">A scenario is an arithmetic estimate, not a prediction. Measured simulations capture real fatigue, handovers and pacing.</p></section><section class="card"><div class="card-header"><h2>What if?</h2>${icon('coach')}</div><p class="small muted">Test your shared running pace, all eight station times and transitions. Both athletes still run every 1 km leg.</p><button class="btn secondary section" data-action="scenario">Build a race scenario ${icon('arrow')}</button></section></div><section class="card section"><div class="card-header"><h2>Measured simulations</h2><span class="small muted">${simulations.length} recorded</span></div>${simulations.length ? `<div class="stack">${simulations.slice().reverse().map(simulation => `<article class="history-card"><div class="row between"><div><div class="eyebrow">${esc(dateLabel(simulation.date, { day: 'numeric', month: 'long', year: 'numeric' }))}</div><h3>${esc(time(simulation.total_seconds))} total</h3></div><span class="tag">RPE ${esc(simulation.rpe ?? '—')}/10</span></div><div class="divider"></div><p class="small"><strong>Run splits:</strong> ${arr(simulation.runs).length ? arr(simulation.runs).map((split, index) => `${index + 1}: ${esc(time(split))}`).join(' · ') : '<span class="muted">No measured run splits</span>'}</p><p class="small section"><strong>Stations:</strong> ${Object.entries(simulation.stations || {}).length ? Object.entries(simulation.stations).map(([key, value]) => `${esc(titleCase(key))}: ${esc(time(value))}`).join(' · ') : '<span class="muted">No measured station splits</span>'}</p><p class="small section"><strong>Transitions:</strong> ${arr(simulation.transitions).length ? simulation.transitions.map(value => esc(time(value))).join(' · ') : '<span class="muted">No measured transitions</span>'}</p>${['notes', 'pacing_notes', 'fuelling_notes', 'difficulty'].filter(key => simulation[key]).map(key => `<p class="small muted section"><strong>${esc(titleCase(key))}:</strong> ${esc(simulation[key])}</p>`).join('')}${Object.keys(simulation.allocations || {}).length ? `<p class="small muted section"><strong>Kenza’s station shares:</strong> ${Object.entries(simulation.allocations).map(([key, value]) => `${esc(titleCase(key))} ${esc(value)}%`).join(' · ')}</p>` : ''}</article>`).join('')}</div>` : empty('Your first rehearsal awaits', 'Log the total time, and only the splits you actually measured. Incomplete split data is welcome.', 'flag')}</section>`;
   }
   function renderCoach() {
-    return `${heading('CLARITY FOR THE NEXT STEP', 'A little guidance goes a long way.', 'Ask about your training, race pacing or how to adapt today’s session.')}<section class="card coach-welcome"><div class="row" style="margin-bottom:15px">${icon('coach')}<span class="tag dark">YOUR TRAINING COMPANION</span></div><h2>Let’s make the next session count.</h2><p>Guidance grounded in your plan and recorded data. No miracle predictions. No medical dosing advice. Just a practical next step.</p></section><div class="coach-prompts">${['What should I focus on this week?', 'How should we split the stations?', 'How do I adapt when I feel tired?'].map(question => `<button class="prompt" data-action="prompt" data-question="${esc(question)}">${icon('coach')}${esc(question)}</button>`).join('')}</div>${state.offline || !navigator.onLine ? '<div class="notice warning">Coach is unavailable offline. Your downloaded workout instructions and fuelling notes are still available. Connect to get a response; no server answer will be invented.</div>' : ''}<div class="chat" role="log" aria-label="Conversation with your training coach">${state.chat.map(message => `<article class="message ${message.role === 'user' ? 'user' : ''}"><div class="message-label">${message.role === 'user' ? esc(person()) : 'PAIR COACH'}</div>${esc(message.text)}</article>`).join('')}</div><form id="coach-form"><div class="coach-input">${textareaField('question', 'Your question', '', 'Ask a specific training question…', true)}<button class="btn" type="submit" aria-label="Send question">${icon('send')}</button></div><p class="form-error" role="alert"></p></form>`;
+    return `${heading('CLARITY FOR THE NEXT STEP', 'A little guidance goes a long way.', 'Ask about your training, race pacing or how to adapt today’s session.')}<section class="card coach-welcome"><div class="row gap-bottom">${icon('coach')}<span class="tag dark">YOUR TRAINING COMPANION</span></div><h2>Let’s make the next session count.</h2><p>Guidance grounded in your plan and recorded data. No miracle predictions. No medical dosing advice. Just a practical next step.</p></section><div class="coach-prompts">${['What should I focus on this week?', 'How should we split the stations?', 'How do I adapt when I feel tired?'].map(question => `<button class="prompt" data-action="prompt" data-question="${esc(question)}">${icon('coach')}${esc(question)}</button>`).join('')}</div>${state.offline || !navigator.onLine ? '<div class="notice warning">Coach is unavailable offline. Your downloaded workout instructions and fuelling notes are still available. Connect to get a response; no server answer will be invented.</div>' : ''}<div class="chat" role="log" aria-label="Conversation with your training coach">${state.chat.map(message => `<article class="message ${message.role === 'user' ? 'user' : ''}"><div class="message-label">${message.role === 'user' ? esc(person()) : 'PAIR COACH'}</div>${esc(message.text)}</article>`).join('')}</div><form id="coach-form"><div class="coach-input">${textareaField('question', 'Your question', '', 'Ask a specific training question…', true)}<button class="btn" type="submit" aria-label="Send question">${icon('send')}</button></div><p class="form-error" role="alert"></p></form>`;
   }
   function renderSettings() {
     const p = profile(), r = race();
-    return `${heading('MAKE IT YOURS', 'Your profile & race.', 'Personal training preferences. Shared race ambitions.')}<div class="grid equal-2"><section class="card"><div class="card-header"><h2>Athlete profile</h2><span class="tag">${esc(p.person || person())}</span></div><form id="profile-form"><div class="form-grid">${field('name', 'Display name', 'text', p.name || p.person, { required: true, maxlength: 80 })}${field('goals', 'Personal goals', 'text', words(p.goals), { maxlength: 1000 })}${textareaField('fuelling_preferences', 'Fuelling preferences & established plan', words(p.fuelling_preferences), 'Foods you tolerate, your established plan, and relevant considerations.')}${textareaField('benchmarks', 'Training benchmarks', typeof p.benchmarks === 'object' ? JSON.stringify(p.benchmarks, null, 2) : '', '{"run_5km_seconds": 1800}')}<div class="span-2 small muted">Benchmarks are optional JSON measurements. No medication dosing is generated from these notes.</div></div><div class="form-actions"><button class="btn" type="submit">Save profile</button></div><p class="form-error" role="alert"></p></form></section><section class="card"><div class="card-header"><h2>Your shared race</h2>${icon('flag')}</div><form id="race-form"><div class="form-grid">${field('name', 'Race name', 'text', r.name, { maxlength: 120 })}${field('date', 'Race date', 'date', r.date, { required: true })}${field('target', 'Target finish time', 'text', num(r.target_seconds) === null ? '' : time(r.target_seconds), { required: true, placeholder: '1:20:00', hint: 'H:MM:SS or M:SS' })}${field('baseline', 'Starting baseline', 'text', num(r.baseline_seconds) === null ? '' : time(r.baseline_seconds), { placeholder: '1:35:00', hint: 'Optional measured reference, not a projection' })}${field('plan_start', 'Plan start date', 'date', r.plan_start, { required: true })}${field('simulation_date', 'Simulation date', 'date', r.simulation_date)}</div><div class="form-actions"><button class="btn" type="submit">Save race & refresh plan</button></div><p class="form-error" role="alert"></p></form><p class="micro muted section">Race settings are shared with your partner. Changing dates refreshes the generated training plan.</p></section></div><section class="card section"><div class="card-header"><h2>Your device & account</h2>${icon('settings')}</div><p class="small muted">Signed in as ${esc(state.session.user.email)}. Workout details, plan history and your queue are stored privately on this device for this account. Signing out clears all locally stored private data.</p><div class="form-actions"><button class="btn secondary" data-action="sync">${icon('sync')} Sync saved workouts${state.queue.length ? ` (${state.queue.length})` : ''}</button><button class="btn outline" data-action="theme">${icon('sun')} ${state.theme === 'dark' ? 'Light' : 'Dark'} appearance</button><button class="btn danger" data-action="logout">Sign out & clear device</button></div><p class="small muted section">Offline switching is disabled. Connect before signing out or signing into another account. Your queue is never discarded because of a sync or authentication error.</p></section>`;
+    return `${heading('MAKE IT YOURS', 'Your profile & race.', 'Personal training preferences. Shared race ambitions.')}
+      <div class="grid equal-2"><section class="card"><div class="card-header"><h2>Athlete profile</h2><span class="tag">${esc(p.person || person())}</span></div>
+      <form id="profile-form"><div class="form-grid">
+      ${textareaField('goals', 'Personal goals', words(p.goals))}
+      ${field('benchmark', 'Measured 10 km benchmark', 'text', num(p.benchmark_seconds) === null ? '' : time(p.benchmark_seconds), { placeholder: '49:15', hint: 'M:SS or H:MM:SS; optional' })}
+      ${field('easy_pace', 'Easy-effort guidance', 'text', p.easy_pace || '', { maxlength: 1000 })}
+      ${textareaField('fuelling_preferences', 'Fuelling preferences & established plan', words(p.fuelling_preferences), 'Foods you tolerate, your established plan, and relevant considerations.')}
+      ${textareaField('notes', 'Athlete notes', p.notes || '', 'Relevant training preferences and limitations.')}
+      </div><div class="form-actions"><button class="btn" type="submit">Save profile</button></div><p class="form-error" role="alert"></p></form></section>
+      <section class="card"><div class="card-header"><h2>Your shared race</h2>${icon('flag')}</div><form id="race-form"><div class="form-grid">
+      ${field('name', 'Race name', 'text', r.name, { maxlength: 100, required: true })}
+      ${field('date', 'Race date', 'date', r.date, { required: true })}
+      ${field('target', 'Target finish time', 'text', num(r.target_seconds) === null ? '' : time(r.target_seconds), { required: true, placeholder: '1:20:00', hint: 'H:MM:SS or M:SS' })}
+      ${field('plan_start', 'Plan start date', 'date', r.plan_start, { required: true })}
+      ${field('simulation_date', 'Simulation date', 'date', r.simulation_date, { required: true })}
+      </div><div class="form-actions"><button class="btn" type="submit">Save race & refresh plan</button></div><p class="form-error" role="alert"></p></form>
+      <div class="divider"></div><div class="metric-row"><span>Starting baseline</span><b>${esc(time(r.baseline_seconds))}</b></div><p class="micro muted">Your starting reference is separate from the live projection. Race settings are shared; changing dates refreshes the training plan.</p></section></div>
+      <section class="card section"><div class="card-header"><h2>Your device & account</h2>${icon('settings')}</div><p class="small muted">Signed in as ${esc(state.session.user.email)}. Workout details, plan history and your queue are stored privately on this device for this account. Signing out clears all locally stored private data.</p><div class="form-actions"><button class="btn secondary" data-action="sync">${icon('sync')} Sync saved workouts${state.queue.length ? ` (${state.queue.length})` : ''}</button><button class="btn outline" data-action="theme">${icon('sun')} ${state.theme === 'dark' ? 'Light' : 'Dark'} appearance</button><button class="btn danger" data-action="logout">Sign out & clear device</button></div><p class="small muted section">Offline switching is disabled. Connect before signing out or signing into another account. Your queue is never discarded because of a sync or authentication error.</p></section>`;
   }
   function field(name, label, type = 'text', value = '', options = {}) {
     const attributes = Object.entries(options).filter(([key]) => key !== 'hint').map(([key, value]) => value === true ? esc(key) : `${esc(key)}="${esc(value)}"`).join(' ');
@@ -367,7 +413,7 @@
     }).join('')}</select></div>`;
   }
   function textareaField(name, label, value = '', placeholder = '', required = false) {
-    return `<div class="field span-2"><label for="f-${esc(name)}">${esc(label)}</label><textarea name="${esc(name)}" id="f-${esc(name)}" maxlength="5000" placeholder="${esc(placeholder)}"${required ? ' required' : ''}>${esc(value)}</textarea></div>`;
+    return `<div class="field span-2"><label for="f-${esc(name)}">${esc(label)}</label><textarea name="${esc(name)}" id="f-${esc(name)}" maxlength="4000" placeholder="${esc(placeholder)}"${required ? ' required' : ''}>${esc(value)}</textarea></div>`;
   }
   function showModal(title, content) {
     const modal = $('#modal');
@@ -377,7 +423,7 @@
   function modalForm(id, content, submit = 'Save', attributes = '') { return `<form id="${esc(id)}" ${attributes}><div class="form-grid">${content}</div><div class="form-actions"><button class="btn" type="submit">${esc(submit)}</button><button class="btn outline" type="button" data-action="close-modal">Cancel</button></div><p class="form-error" role="alert"></p></form>`; }
   function readinessModal() {
     const checkin = state.dashboard.checkin || {};
-    showModal('Meet yourself where you are.', `<p class="small muted" style="margin-bottom:20px">An honest check-in is more useful than a perfect score. Pain can change the plan: don’t train through warning signs.</p>${modalForm('readiness-form', field('sleep', 'Sleep (hours)', 'number', checkin.sleep ?? '', { required: true, min: 0, max: 24, step: .5 }) + field('soreness', 'Soreness (0–10)', 'number', checkin.soreness ?? '', { required: true, min: 0, max: 10, step: 1 }) + field('fatigue', 'Fatigue (0–10)', 'number', checkin.fatigue ?? '', { required: true, min: 0, max: 10, step: 1 }) + field('pain', 'Pain (0–10)', 'number', checkin.pain ?? '', { required: true, min: 0, max: 10, step: 1 }), 'Save check-in')}`);
+    showModal('Meet yourself where you are.', `<p class="small muted modal-intro">An honest check-in is more useful than a perfect score. Pain can change the plan: don’t train through warning signs.</p>${modalForm('readiness-form', field('sleep', 'Sleep (hours)', 'number', checkin.sleep ?? '', { required: true, min: 0, max: 24, step: .5 }) + field('soreness', 'Soreness (0–10)', 'number', checkin.soreness ?? '', { required: true, min: 0, max: 10, step: 1 }) + field('fatigue', 'Fatigue (0–10)', 'number', checkin.fatigue ?? '', { required: true, min: 0, max: 10, step: 1 }) + field('pain', 'Pain (0–10)', 'number', checkin.pain ?? '', { required: true, min: 0, max: 10, step: 1 }), 'Save check-in')}`);
   }
   const metricSpecs = {
     distance: ['Distance (km)', 'number', .01], distance_m: ['Distance (m)', 'number', 1], pace: ['Pace per km (M:SS)', 'text'], splits: ['Measured splits (M:SS, comma-separated)', 'text'], hr: ['Average heart rate (bpm)', 'number', 1], exercise: ['Exercise', 'text'], sets: ['Sets', 'number', 1], reps: ['Reps', 'number', 1], load: ['Load (kg)', 'number', .5], station: ['Station name', 'text'], time: ['Station time (M:SS)', 'text'], rest: ['Rest (seconds)', 'number', 1], stroke_rate: ['Stroke rate (strokes/min)', 'number', 1]
@@ -386,8 +432,8 @@
     const workout = findWorkout(id);
     if (!workout) return notify('Choose a workout from the plan first.');
     const saved = workoutLog(workout.date) || {};
-    const metrics = [...new Set([...arr(workout.metrics), 'distance', 'pace', 'splits', 'hr', 'exercise', 'sets', 'reps', 'load', 'station', 'time', 'rest', 'stroke_rate'])].filter(item => typeof item === 'string');
-    showModal('Record the work you did.', `<p class="small muted" style="margin-bottom:20px">${esc(workout.title)} · ${esc(dateLabel(workout.date))}. Metrics are optional: leave unmeasured values blank. Saving works offline.</p>${modalForm('log-form', selectField('status', 'Session status', ['completed', 'started', 'skipped', 'modified'], saved.status || 'completed') + field('duration', 'Duration (minutes)', 'number', saved.duration ?? workout.duration, { min: 0, max: 1440, step: 1, required: true }) + field('rpe', 'Effort / RPE (1–10)', 'number', saved.rpe ?? '', { min: 1, max: 10, step: 1 }) + field('energy', 'Energy (0–10)', 'number', saved.energy ?? '', { min: 0, max: 10, step: 1 }) + field('soreness', 'Soreness (0–10)', 'number', saved.soreness ?? '', { min: 0, max: 10, step: 1 }) + field('sleep', 'Sleep (hours)', 'number', saved.sleep ?? '', { min: 0, max: 24, step: .5 }) + field('pain', 'Pain (0–10)', 'number', saved.pain ?? '', { min: 0, max: 10, step: 1 }) + field('session_time', 'Session time', 'time', saved.session_time || '') + metrics.map(key => {
+    const metrics = [...new Set([...arr(workout.metrics), 'distance', 'pace', 'splits', 'hr', 'exercise', 'sets', 'reps', 'load', 'station', 'time', 'rest', 'stroke_rate'])].filter(item => typeof item === 'string' && !['duration', 'rpe', 'notes', 'runs', 'stations', 'transitions'].includes(item));
+    showModal('Record the work you did.', `<p class="small muted modal-intro">${esc(workout.title)} · ${esc(dateLabel(workout.date))}. Completed or modified work needs duration and RPE. Other metrics are optional: leave unmeasured values blank. Saving works offline.</p>${modalForm('log-form', selectField('status', 'Session status', ['completed', 'started', 'skipped', 'modified'], saved.status || 'completed') + field('duration', 'Duration (minutes)', 'number', saved.duration ?? workout.duration, { min: 0, max: 600, step: 1, required: true }) + field('rpe', 'Effort / RPE (1–10)', 'number', saved.rpe ?? '', { min: 1, max: 10, step: 1 }) + field('energy', 'Energy (0–10)', 'number', saved.energy ?? '', { min: 0, max: 10, step: 1 }) + field('soreness', 'Soreness (0–10)', 'number', saved.soreness ?? '', { min: 0, max: 10, step: 1 }) + field('sleep', 'Sleep (hours)', 'number', saved.sleep ?? '', { min: 0, max: 24, step: .5 }) + field('pain', 'Pain (0–10)', 'number', saved.pain ?? '', { min: 0, max: 10, step: 1 }) + field('session_time', 'Session time', 'time', saved.session_time || '') + metrics.map(key => {
       const spec = metricSpecs[key] || [titleCase(key), 'text'];
       const value = saved.metrics?.[key];
       return field(`metric_${key}`, spec[0], spec[1], Array.isArray(value) ? value.map(time).join(', ') : ['pace', 'time'].includes(key) && typeof value === 'number' ? time(value) : value ?? '', spec[1] === 'number' ? { min: 0, max: key === 'hr' ? 250 : 100000, step: spec[2] || .1 } : { maxlength: 1000 });
@@ -395,23 +441,23 @@
   }
   function externalModal(date = state.selectedDate) {
     const existing = workouts().find(item => item.date === date);
-    showModal('Make room for your class.', `<p class="small muted" style="margin-bottom:20px">This replaces your personal planned session on the selected date. Include class instructions, sets, reps and loads so they’re available offline.</p>${modalForm('external-form', field('date', 'Class date', 'date', date || today(), { required: true }) + field('title', 'Class title', 'text', existing?.type === 'external' ? existing.title : '', { required: true, maxlength: 120 }) + field('duration', 'Duration (minutes)', 'number', existing?.type === 'external' ? existing.duration : 45, { required: true, min: 1, max: 600, step: 1 }) + selectField('intensity', 'Intensity', ['low', 'moderate', 'high'], existing?.type === 'external' ? existing.intensity : 'moderate') + textareaField('main', 'Class instructions (one step per line)', existing?.type === 'external' ? arr(existing.main).join('\n') : '', '4 sets × 8 reps\nExercise, load and rest instructions', true), 'Save class & update plan')}`);
+    showModal('Make room for your class.', `<p class="small muted modal-intro">This replaces your personal planned session on the selected date. Include class instructions, sets, reps and loads so they’re available offline.</p>${modalForm('external-form', field('date', 'Class date', 'date', date || today(), { required: true }) + field('title', 'Class title', 'text', existing?.type === 'external' ? existing.title : '', { required: true, maxlength: 120 }) + field('duration', 'Duration (minutes)', 'number', existing?.type === 'external' ? existing.duration : 45, { required: true, min: 1, max: 180, step: 1 }) + selectField('intensity', 'Intensity', ['easy', 'moderate', 'hard', 'recovery'], existing?.type === 'external' ? existing.intensity : 'moderate') + textareaField('main', 'Class instructions (one step per line)', existing?.type === 'external' ? arr(existing.main).join('\n') : '', '4 sets × 8 reps\nExercise, load and rest instructions', true), 'Save class & update plan')}`);
   }
   function measurementModal(id) {
     const station = stations().find(item => item.id === id);
     if (!station) return;
     const measured = state.dashboard.measurements?.[id] || {};
-    showModal(`${station.name}: real measurements`, `<p class="small muted" style="margin-bottom:20px">Use comparable full-station tests. Fatigue is rated 0–10. Share is Kenza’s percentage of station work, not running.</p>${modalForm('measurement-form', field('kenza_time', 'Kenza station time', 'text', measured.kenza_seconds == null ? '' : time(measured.kenza_seconds), { placeholder: 'M:SS' }) + field('rob_time', 'Rob station time', 'text', measured.rob_seconds == null ? '' : time(measured.rob_seconds), { placeholder: 'M:SS' }) + field('kenza_fatigue', 'Kenza fatigue (0–10)', 'number', measured.kenza_fatigue ?? '', { min: 0, max: 10, step: 1 }) + field('rob_fatigue', 'Rob fatigue (0–10)', 'number', measured.rob_fatigue ?? '', { min: 0, max: 10, step: 1 }) + field('transition_time', 'Transition time', 'text', measured.transition_seconds == null ? '' : time(measured.transition_seconds), { placeholder: 'M:SS' }) + field('preferred_share', 'Kenza preferred share (%)', 'number', measured.preferred_share ?? '', { min: 0, max: 100, step: 1 }), 'Save measurements', `data-station="${esc(id)}"`)}`);
+    showModal(`${station.name}: real measurements`, `<p class="small muted modal-intro">Use comparable full-station tests. Fatigue is rated 0–10. Share is Kenza’s percentage of station work, not running. Blank values remove a previous measurement.</p>${modalForm('measurement-form', field('kenza_time', 'Kenza station time', 'text', measured.kenza_seconds == null ? '' : time(measured.kenza_seconds), { placeholder: 'M:SS' }) + field('rob_time', 'Rob station time', 'text', measured.rob_seconds == null ? '' : time(measured.rob_seconds), { placeholder: 'M:SS' }) + field('kenza_fatigue', 'Kenza fatigue (0–10)', 'number', measured.kenza_fatigue ?? '', { min: 0, max: 10, step: 1 }) + field('rob_fatigue', 'Rob fatigue (0–10)', 'number', measured.rob_fatigue ?? '', { min: 0, max: 10, step: 1 }) + field('transition_time', 'Transition time', 'text', measured.transition_seconds == null ? '' : time(measured.transition_seconds), { placeholder: 'M:SS' }) + field('preferred_share', 'Kenza preferred share (%)', 'number', measured.preferred_share == null ? '' : Math.round(measured.preferred_share * 100), { min: 0, max: 100, step: 1 }), 'Save measurements', `data-station="${esc(id)}"`)}`);
   }
   function simulationModal() {
     const stationFields = stations().map(station => field(`station_${station.id}`, `${station.name} time`, 'text', '', { placeholder: 'M:SS · optional' }) + field(`allocation_${station.id}`, `${station.name}: Kenza share (%)`, 'number', '', { min: 0, max: 100, step: 1 })).join('');
-    showModal('Your race rehearsal, recorded.', `<p class="small muted" style="margin-bottom:20px">Total time is required. Only enter splits that were measured. Eight run splits and eight transition splits if available; leave blank if not recorded.</p>${modalForm('simulation-form', field('date', 'Simulation date', 'date', today(), { required: true }) + field('total', 'Total time', 'text', '', { placeholder: '1:25:00', required: true }) + field('rpe', 'Overall RPE (1–10)', 'number', '', { min: 1, max: 10, step: 1 }) + selectField('difficulty', 'Difficulty', ['not recorded', 'easy', 'moderate', 'hard', 'very hard'], 'not recorded') + textareaField('runs', 'Eight run splits (comma-separated)', '', '5:30, 5:35, 5:40, …') + textareaField('transitions', 'Eight transitions (comma-separated)', '', '0:20, 0:25, 0:20, …') + stationFields + textareaField('notes', 'Session notes') + textareaField('pacing_notes', 'Pacing observations') + textareaField('fuelling_notes', 'Fuelling observations'), 'Save measured simulation')}`);
+    showModal('Your race rehearsal, recorded.', `<p class="small muted modal-intro">Total time is required. Only enter splits that were measured. Eight run splits and eight transition splits if available; leave blank if not recorded.</p>${modalForm('simulation-form', field('date', 'Simulation date', 'date', today(), { required: true, max: today() }) + field('total', 'Total time', 'text', '', { placeholder: '1:25:00', required: true }) + field('rpe', 'Overall RPE (1–10)', 'number', '', { min: 1, max: 10, step: 1 }) + field('difficulty', 'Difficulty (0–10, optional)', 'number', '', { min: 0, max: 10, step: 1 }) + textareaField('runs', 'Eight run splits (comma-separated)', '', '5:30, 5:35, 5:40, …') + textareaField('transitions', 'Eight transitions (comma-separated)', '', '0:20, 0:25, 0:20, …') + stationFields + textareaField('notes', 'Session notes') + textareaField('pacing_notes', 'Pacing observations') + textareaField('fuelling_notes', 'Fuelling observations'), 'Save measured simulation')}`);
   }
   function scenarioModal() {
-    showModal('A scenario, not a promise.', `<p class="small muted" style="margin-bottom:20px">The same shared pace is applied to eight 1 km runs. Enter all eight station and transition times. This arithmetic scenario is not stored as a measured simulation.</p>${modalForm('scenario-form', field('pace', 'Shared pace per km', 'text', '5:30', { required: true, placeholder: 'M:SS' }) + '<div></div>' + stations().map(station => field(`station_${station.id}`, station.name, 'text', '', { required: true, placeholder: 'M:SS' })).join('') + textareaField('transitions', 'Eight transition times (comma-separated)', '', '0:20, 0:20, 0:20, 0:20, 0:20, 0:20, 0:20, 0:20', true), 'Calculate scenario')}<div id="scenario-result" aria-live="polite"></div>`);
+    showModal('A scenario, not a promise.', `<p class="small muted modal-intro">The same shared pace is applied to eight 1 km runs. Enter all eight station and transition times. This arithmetic scenario is not stored as a measured simulation.</p>${modalForm('scenario-form', field('pace', 'Shared pace per km', 'text', '5:30', { required: true, placeholder: 'M:SS' }) + '<div></div>' + stations().map(station => field(`station_${station.id}`, station.name, 'text', '', { required: true, placeholder: 'M:SS' })).join('') + textareaField('transitions', 'Eight transition times (comma-separated)', '', '0:20, 0:20, 0:20, 0:20, 0:20, 0:20, 0:20, 0:20', true), 'Calculate scenario')}<div id="scenario-result" aria-live="polite"></div>`);
   }
   function stationSettingsModal() {
-    showModal('Confirm your race standards.', `<p class="small muted" style="margin-bottom:20px">Advanced station configuration. Keep the eight station IDs stable. Confirm standards against the official event rulebook. JSON lets you retain loads, reps, distances and instructions without losing fields.</p>${modalForm('station-settings-form', textareaField('stations', 'Station profiles (JSON array)', JSON.stringify(stations().map(({ index, ...station }) => station), null, 2), '', true), 'Save station standards')}`);
+    showModal('Confirm your race standards.', `<p class="small muted modal-intro">Confirm distances and loads against your division’s official event rules. Sled loads include the sled. Only distances, loads and your notes are changed; station instructions remain available offline.</p>${modalForm('station-settings-form', stations().map(station => `<div class="span-2"><h3>${esc(station.name)}</h3><p class="micro muted">${esc(station.reference || station.instruction || '')}</p></div>${field(`distance_${station.id}`, `Distance / reps (${station.unit || 'm'})`, 'number', station.distance, { min: 0, max: 2000, step: 1, required: true })}${field(`load_${station.id}`, `Load (${station.load_unit || 'kg'})`, 'number', station.load ?? '', { min: 0, max: 2000, step: .5 })}${textareaField(`notes_${station.id}`, `${station.name} notes`, station.notes || '')}`).join(''), 'Save station standards')}`);
   }
   function splitTimes(value, label, required = false) {
     const text = String(value || '').trim();
@@ -469,12 +515,16 @@
       else if (action === 'logout') await logout();
       else if (action === 'confirm-logout') {
         button.disabled = true;
-        const session = await api('/api/session');
-        await api('/api/logout', 'POST', {}, session.csrf_token);
-        await store('clear', 'private');
-        await store('clear', 'queue');
-        state.session = null; state.dashboard = null; state.queue = []; state.chat = []; state.syncError = ''; state.offline = false;
-        $('#modal').close(); location.hash = ''; renderAuth(); notify('Signed out. Private device data cleared.');
+        if (syncPromise) await syncPromise;
+        await withPrivateLock(async () => {
+          const session = await api('/api/session');
+          await api('/api/logout', 'POST', {}, session.csrf_token);
+          await store('clear', 'private');
+          await store('clear', 'queue');
+          state.session = null; state.dashboard = null; state.queue = []; state.chat = []; state.syncError = ''; state.offline = false;
+          invalidateOtherTabs();
+          $('#modal').close(); location.hash = ''; renderAuth(); notify('Signed out. Private device data cleared.');
+        });
       } else if (action === 'copy-invite') {
         const code = team().invite_code;
         if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(code); notify('Invite code copied.'); }
@@ -505,19 +555,23 @@
           await api('/api/password-reset', 'POST', { email: values.email });
           $('.form-error', form).textContent = 'If an account exists and email delivery is configured, reset instructions will be sent. If you cannot receive email, contact the service administrator.';
         } else if (mode === 'confirm') {
-          await api('/api/password-reset/confirm', 'POST', { token: new URLSearchParams(location.search).get('token'), password: values.password });
+          await api('/api/password-reset/confirm', 'POST', { token: resetToken(), password: values.password });
           history.replaceState(null, '', '/');
           state.authMode = 'login'; renderAuth('Password updated. Sign in with your new password.');
         } else {
-          const data = await api(`/api/${mode === 'signup' ? 'signup' : 'login'}`, 'POST', mode === 'signup' ? { email: values.email, password: values.password, person: values.person, ...(values.invite_code ? { invite_code: values.invite_code.trim() } : {}) } : { email: values.email, password: values.password });
-          state.session = data;
-          state.chat = [];
-          state.offline = false;
-          await refresh();
-          render(); await syncQueue();
+          await withPrivateLock(async () => {
+            const data = await api(`/api/${mode === 'signup' ? 'signup' : 'login'}`, 'POST', mode === 'signup' ? { email: values.email, password: values.password, person: values.person, ...(values.invite_code ? { invite_code: values.invite_code.trim() } : {}) } : { email: values.email, password: values.password });
+            state.session = data;
+            state.chat = [];
+            state.offline = false;
+            await refresh();
+            invalidateOtherTabs();
+          });
+          render(); if (state.queue.length) await syncQueue();
         }
       } else if (form.id === 'log-form') {
-        const payload = { client_id: uuid(), date: form.dataset.date, status: values.status, duration: Number(values.duration), metrics: {} };
+        if (form.dataset.date > today()) throw new Error('Record this workout on or after its planned date, not in advance.');
+        const payload = { client_id: uuid(), athlete_id: state.session.user.id, date: form.dataset.date, status: values.status, duration: Number(values.duration), metrics: {} };
         ['rpe', 'energy', 'soreness', 'sleep', 'pain'].forEach(key => { if (values[key] !== '') payload[key] = Number(values[key]); });
         ['notes', 'session_time', 'pre_session_food', 'glucose_notes', 'modification'].forEach(key => { if (values[key]) payload[key] = values[key]; });
         Object.entries(values).filter(([key, value]) => key.startsWith('metric_') && value !== '').forEach(([key, value]) => {
@@ -526,6 +580,8 @@
           else if (['pace', 'time'].includes(metric)) payload.metrics[metric] = parseTime(value, titleCase(metric));
           else payload.metrics[metric] = metricSpecs[metric]?.[1] === 'number' ? Number(value) : value;
         });
+        if (payload.metrics.distance != null) payload.metrics.unit = 'km';
+        if (['completed', 'modified'].includes(payload.status) && (!(payload.duration > 0) || !(payload.rpe >= 1 && payload.rpe <= 10))) throw new Error('Completed or modified sessions need a positive duration and an RPE between 1 and 10.');
         if (payload.status === 'modified' && !payload.modification) throw new Error('Describe what changed for a modified workout.');
         await queueWorkout(payload);
         $('#modal').close(); render(); notify('Workout saved on this device.');
@@ -533,27 +589,24 @@
       } else if (form.id === 'readiness-form') {
         await saveOnline('/api/readiness', 'POST', Object.fromEntries(Object.entries(values).map(([key, value]) => [key, Number(value)])), 'Check-in saved. Your plan has been refreshed.');
       } else if (form.id === 'profile-form') {
-        let benchmarks = {};
-        if (values.benchmarks.trim()) {
-          try { benchmarks = JSON.parse(values.benchmarks); } catch { throw new Error('Benchmarks must be valid JSON, for example {"run_5km_seconds":1800}.'); }
-          if (!benchmarks || Array.isArray(benchmarks) || typeof benchmarks !== 'object') throw new Error('Benchmarks must be a JSON object.');
-        }
-        await saveOnline('/api/profile', 'PUT', { name: values.name, goals: values.goals, fuelling_preferences: values.fuelling_preferences, benchmarks }, 'Profile updated.');
+        const data = { goals: values.goals, fuelling_preferences: values.fuelling_preferences, notes: values.notes, easy_pace: values.easy_pace };
+        if (values.benchmark) data.benchmark_seconds = parseTime(values.benchmark, '10 km benchmark');
+        await saveOnline('/api/profile', 'PUT', data, 'Profile updated.');
       } else if (form.id === 'race-form') {
-        if (values.plan_start > values.date) throw new Error('Plan start must be on or before race day.');
-        if (values.simulation_date && (values.simulation_date < values.plan_start || values.simulation_date > values.date)) throw new Error('Simulation date must fall between your plan start and race date.');
-        const data = { name: values.name, date: values.date, plan_start: values.plan_start, target_seconds: parseTime(values.target, 'Target finish time'), simulation_date: values.simulation_date || null };
-        if (values.baseline) data.baseline_seconds = parseTime(values.baseline, 'Baseline');
+        if (values.plan_start >= values.date) throw new Error('Plan start must be before race day.');
+        if (values.simulation_date <= values.plan_start || values.simulation_date >= values.date) throw new Error('Simulation date must be after plan start and before race day.');
+        const data = { name: values.name, date: values.date, plan_start: values.plan_start, target_seconds: parseTime(values.target, 'Target finish time'), simulation_date: values.simulation_date };
         await saveOnline('/api/race', 'PUT', data, 'Race settings saved. Your training plan is refreshed.');
       } else if (form.id === 'external-form') {
         await saveOnline('/api/workouts/external', 'POST', { date: values.date, title: values.title, duration: Number(values.duration), intensity: values.intensity, main: values.main.split('\n').map(line => line.trim()).filter(Boolean) }, 'Class saved to your plan.');
       } else if (form.id === 'measurement-form') {
-        const measured = { ...(state.dashboard.measurements?.[form.dataset.station] || {}) };
+        const measured = {};
         ['kenza_time', 'rob_time', 'transition_time'].forEach(key => { if (values[key]) measured[key.replace('_time', '_seconds')] = parseTime(values[key], titleCase(key)); });
-        ['kenza_fatigue', 'rob_fatigue', 'preferred_share'].forEach(key => { if (values[key] !== '') measured[key] = Number(values[key]); });
+        ['kenza_fatigue', 'rob_fatigue', 'preferred_share'].forEach(key => { if (values[key] !== '') measured[key] = Number(values[key]) / (key === 'preferred_share' ? 100 : 1); });
         await saveOnline('/api/measurements', 'PUT', { measurements: { ...(state.dashboard.measurements || {}), [form.dataset.station]: measured } }, 'Station measurements saved.');
       } else if (form.id === 'simulation-form') {
-        const data = { date: values.date, total_seconds: parseTime(values.total, 'Total simulation time'), runs: splitTimes(values.runs, 'Run splits'), transitions: splitTimes(values.transitions, 'Transitions'), stations: {}, allocations: {}, notes: values.notes, pacing_notes: values.pacing_notes, fuelling_notes: values.fuelling_notes, difficulty: values.difficulty === 'not recorded' ? '' : values.difficulty };
+        const data = { date: values.date, total_seconds: parseTime(values.total, 'Total simulation time'), runs: splitTimes(values.runs, 'Run splits'), transitions: splitTimes(values.transitions, 'Transitions'), stations: {}, allocations: {}, notes: values.notes, pacing_notes: values.pacing_notes, fuelling_notes: values.fuelling_notes };
+        if (values.difficulty !== '') data.difficulty = Number(values.difficulty);
         if (values.rpe !== '') data.rpe = Number(values.rpe);
         stations().forEach(station => {
           if (values[`station_${station.id}`]) data.stations[station.id] = parseTime(values[`station_${station.id}`], station.name);
@@ -566,12 +619,9 @@
         if (String(session.user.id) !== String(state.session.user.id)) throw new Error('Account changed. Reload before requesting a scenario.');
         state.session = session;
         const data = await api('/api/scenario', 'POST', { run_pace_seconds: parseTime(values.pace, 'Shared run pace'), station_seconds: stations().map(station => parseTime(values[`station_${station.id}`], station.name)), transition_seconds: splitTimes(values.transitions, 'Transitions', true) });
-        $('#scenario-result').innerHTML = `<div class="notice section"><strong>Hypothetical finish: ${esc(time(data.seconds))}</strong><br>Running ${esc(time(data.run_seconds))} · Stations ${esc(time(data.station_seconds))} · Transitions ${esc(time(data.transition_seconds))}<br>Arithmetic scenario only. Not saved as measured data or a guaranteed projection.</div>`;
+        $('#scenario-result').innerHTML = `<div class="notice section"><strong>Hypothetical finish: ${esc(time(data.seconds))}</strong><br>Running ${esc(time(data.run_seconds ?? data.breakdown?.runs))} · Stations ${esc(time(data.station_seconds ?? data.breakdown?.stations))} · Transitions ${esc(time(data.transition_seconds ?? data.breakdown?.transitions))}<br>Arithmetic scenario only. Not saved as measured data or a guaranteed projection.</div>`;
       } else if (form.id === 'station-settings-form') {
-        let data;
-        try { data = JSON.parse(values.stations); } catch { throw new Error('Station configuration must be valid JSON.'); }
-        if (!Array.isArray(data) || data.length !== 8 || data.some(item => !item || typeof item !== 'object' || !item.id || !item.name)) throw new Error('Provide eight station objects, each with an id and name.');
-        if (new Set(data.map(item => item.id)).size !== 8) throw new Error('Each station must have a unique ID.');
+        const data = stations().map(({ index, ...station }) => ({ ...station, distance: Number(values[`distance_${station.id}`]), load: values[`load_${station.id}`] === '' ? null : Number(values[`load_${station.id}`]), notes: values[`notes_${station.id}`] }));
         await saveOnline('/api/stations', 'PUT', { stations: data }, 'Station standards updated.');
       } else if (form.id === 'team-form') {
         await saveOnline('/api/team', 'PUT', { name: values.name }, 'Team name updated.');
@@ -594,6 +644,12 @@
   });
   window.addEventListener('offline', () => { state.offline = true; if (state.session && state.dashboard) render(); });
   window.addEventListener('online', () => { if (state.session) syncQueue(); else renderAuth(); });
+  window.addEventListener('storage', event => {
+    if (event.key !== 'pair-account-event') return;
+    state.session = null; state.dashboard = null; state.queue = []; state.chat = []; state.syncError = ''; state.offline = false;
+    $('#modal').close();
+    renderAuth('The account session changed in another tab. Connect and sign in to securely reopen your training space.');
+  });
   $('#modal').addEventListener('click', event => { if (event.target === $('#modal') && event.clientX && (event.clientX < $('#modal').getBoundingClientRect().left || event.clientX > $('#modal').getBoundingClientRect().right || event.clientY < $('#modal').getBoundingClientRect().top || event.clientY > $('#modal').getBoundingClientRect().bottom)) $('#modal').close(); });
   init();
 })();

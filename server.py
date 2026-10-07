@@ -11,9 +11,9 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
-import mimetypes
 import os
 from pathlib import Path
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -31,6 +31,14 @@ ALLOWED_HOSTS = set(os.environ.get("ALLOWED_HOSTS", urlsplit(PUBLIC_URL).netloc 
 DEFAULT_RACE = {
     "name": "HYROX London", "date": "2026-12-02", "target_seconds": 3900,
     "baseline_seconds": 4252, "simulation_date": "2026-11-14", "plan_start": "2026-10-08",
+}
+STATIC_TYPES = {
+    "/index.html": "text/html",
+    "/app.js": "text/javascript",
+    "/style.css": "text/css",
+    "/sw.js": "text/javascript",
+    "/manifest.webmanifest": "application/manifest+json",
+    "/icon.svg": "image/svg+xml",
 }
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -225,7 +233,14 @@ def dashboard(db, user_id, csrf):
         if day < date.today().isoformat() and day in saved:
             plan[i] = saved[day]
         if day in external:
-            safety = plan[i] if plan[i].get("adjustment") else None
+            protected_phase = plan[i].get("phase") in ("taper", "simulation") or plan[i]["type"] in ("recovery", "rest")
+            safety = dict(plan[i]) if plan[i].get("adjustment") or protected_phase else None
+            if safety and not safety.get("adjustment"):
+                safety["adjustment"] = {
+                    "what": "Retain recovery or phase-specific class limits",
+                    "why": "Entered class content cannot replace simulation recovery or taper protections.",
+                    "effect": "Keep the planned duration and effort; ask the instructor to scale the class.",
+                }
             plan[i] = {**plan[i], **external[day]}
             if safety:
                 for key in ("title", "type", "intensity", "duration", "main", "adjustment"):
@@ -426,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
         team_id = state["team"]["id"]
         method = self.command
         if path == "/api/workouts/log" and method == "POST":
+            if data.get("athlete_id") != user_id:
+                raise Invalid("Workout account changed. Sign in as the athlete who recorded it before retrying.")
             client_id = text(data.get("client_id"), "client ID", 100, True)
             if db.execute("SELECT 1 FROM mutation_keys WHERE user_id=? AND client_id=?", (user_id, client_id)).fetchone():
                 return {"ok": True, "duplicate": True}
@@ -437,7 +454,7 @@ class Handler(BaseHTTPRequestHandler):
             for key, high in (("duration", 600), ("rpe", 10), ("energy", 10), ("soreness", 10), ("sleep", 24), ("pain", 10)):
                 value = data.get(key, 0 if key in ("duration", "rpe") else None)
                 log[key] = None if value is None and key not in ("duration", "rpe") else number(value, key, 0, high)
-            if status == "completed" and (log["duration"] <= 0 or log["rpe"] < 1):
+            if (status == "completed" or status == "modified" and log["duration"] > 0) and (log["duration"] <= 0 or log["rpe"] < 1):
                 raise Invalid("Completed sessions need a positive duration and RPE 1–10.")
             for key in ("notes", "modification", "pre_session_food", "glucose_notes"):
                 log[key] = text(data.get(key, ""), key, 4000)
@@ -451,26 +468,44 @@ class Handler(BaseHTTPRequestHandler):
                     number(value, key)
                 elif isinstance(value, str):
                     text(value, key, 4000)
+                elif key == "splits" and isinstance(value, list) and len(value) <= 100:
+                    for split in value:
+                        number(split, "split seconds", 0, 86400)
                 else:
-                    raise Invalid("Metrics must be numbers or text.")
+                    raise Invalid("Metrics must be numbers, text, or measured numeric split arrays.")
             log["metrics"] = metrics
             db.execute("INSERT INTO mutation_keys VALUES (?,?)", (user_id, client_id))
             db.execute("INSERT INTO workout_completions VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET data=excluded.data", (user_id, day, encoded(log)))
             nutrition = {k: log[k] for k in ("session_time", "pre_session_food", "glucose_notes")}
             db.execute("INSERT INTO nutrition_logs VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET data=excluded.data", (user_id, day, encoded(nutrition)))
+            if day == date.today().isoformat():
+                signals = {k: log[k] for k in ("sleep", "soreness", "pain") if log[k] is not None}
+                if log["energy"] is not None:
+                    signals["fatigue"] = 10 - log["energy"]
+                if signals:
+                    signals = {**state["checkin"], **signals}
+                    db.execute("INSERT INTO readiness_logs(user_id,created_at,data) VALUES (?,?,?)",
+                               (user_id, datetime.now(timezone.utc).isoformat(), encoded(signals)))
             return {"ok": True, "log": log}
         if path == "/api/readiness" and method == "POST":
             checkin = {k: number(data[k], k, 0, 24 if k == "sleep" else 10)
                        for k in ("sleep", "soreness", "fatigue", "pain") if k in data and data[k] is not None}
             if not checkin:
                 raise Invalid("Enter at least one readiness measurement.")
+            checkin = {**state["checkin"], **checkin}
             db.execute("INSERT INTO readiness_logs(user_id,created_at,data) VALUES (?,?,?)", (user_id, datetime.now(timezone.utc).isoformat(), encoded(checkin)))
             return {"ok": True, "readiness": coach.readiness(state["logs"], checkin)}
         if path == "/api/profile" and method == "PUT":
             profile = state["profile"]
-            for key in ("goals", "fuelling_preferences", "notes", "easy_pace"):
+            for key in ("name", "goals", "fuelling_preferences", "notes", "easy_pace"):
                 if key in data:
                     profile[key] = text(data[key], key, 4000)
+            if "easy_pace" in data:
+                pace = re.match(r"^(\d{1,2}):([0-5]\d)", profile["easy_pace"])
+                if pace:
+                    profile["easy_pace_seconds"] = number(int(pace[1]) * 60 + int(pace[2]), "easy pace seconds/km", 180, 1200)
+            if "easy_pace_seconds" in data:
+                profile["easy_pace_seconds"] = number(data["easy_pace_seconds"], "easy pace seconds/km", 180, 1200)
             if "benchmark_seconds" in data:
                 profile["benchmark_seconds"] = number(data["benchmark_seconds"], "10K benchmark seconds", 600, 14400)
             db.execute("UPDATE athletes SET profile=? WHERE user_id=?", (encoded(profile), user_id))
@@ -548,6 +583,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise Invalid("Split totals cannot exceed the total time.")
             sim["rpe"] = number(data.get("rpe", 0), "RPE", 0, 10)
             sim["difficulty"] = number(data.get("difficulty", 0), "difficulty", 0, 10)
+            for key in ("scaled", "comparable", "full_distance"):
+                if key in data:
+                    if not isinstance(data[key], bool):
+                        raise Invalid(f"{key} must be true or false.")
+                    sim[key] = data[key]
             for key in ("notes", "pacing_notes", "fuelling_notes", "transition_notes"):
                 sim[key] = text(data.get(key, ""), key, 4000)
             db.execute("INSERT INTO simulation_results VALUES (?,?,?,?) ON CONFLICT(team_id,date) DO UPDATE SET data=excluded.data", (secrets.token_hex(16), team_id, sim["date"], encoded(sim)))
@@ -585,7 +625,7 @@ class Handler(BaseHTTPRequestHandler):
             path = path[len("/static"):]
         path = "/index.html" if path == "/" else path
         # Explicit allowlist prevents traversal and exposing source/database files.
-        if path not in {"/index.html", "/app.js", "/style.css", "/sw.js", "/manifest.webmanifest", "/icon.svg"}:
+        if path not in STATIC_TYPES:
             return self.respond(404, {"error": "Not found."})
         file = ROOT / "static" / path[1:]
         if not file.is_file():
@@ -593,8 +633,7 @@ class Handler(BaseHTTPRequestHandler):
         content = file.read_bytes()
         self.send_response(200)
         self.headers_common()
-        content_type = "application/manifest+json" if path.endswith("webmanifest") else mimetypes.guess_type(str(file))[0] or "application/octet-stream"
-        self.send_header("Content-Type", content_type + "; charset=utf-8")
+        self.send_header("Content-Type", STATIC_TYPES[path] + "; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-cache")
         if path == "/sw.js":

@@ -48,6 +48,8 @@ class APITest(unittest.TestCase):
             headers["Cookie"] = session["cookie"]
             if csrf:
                 headers["X-CSRF-Token"] = session["csrf_token"]
+            if path == "/api/workouts/log" and isinstance(data, dict):
+                data = {"athlete_id": session["user"]["id"], **data}
         headers.update(extra or {})
         conn.request(method, path, json.dumps(data) if data is not None else None, headers)
         response = conn.getresponse()
@@ -94,6 +96,8 @@ class APITest(unittest.TestCase):
     def test_logging_is_idempotent_persistent_and_athlete_scoped(self):
         ken = self.signup()
         rob = self.signup("rob@example.test", "Rob", ken["team"]["invite_code"])
+        self.assertEqual(self.request("/api/workouts/log", "POST", {"athlete_id": ken["user"]["id"],
+            "client_id": "cross-account", "date": "2026-10-07", "status": "started"}, rob)[0], 400)
         log = {"client_id": "offline-event-1", "date": "2026-10-07", "status": "completed",
                "duration": 60, "rpe": 7, "sleep": 8, "metrics": {"distance": 5}, "notes": "Intervals"}
         self.assertEqual(self.request("/api/workouts/log", "POST", log, ken)[0], 200)
@@ -205,6 +209,68 @@ class APITest(unittest.TestCase):
             self.assertTrue(server.limited(db, "test-auth-key", maximum=2))
             self.assertTrue(server.limited(db, "test-auth-key", maximum=2))
             self.assertFalse(server.limited(db, "test-auth-key", maximum=2))
+
+    def test_static_response_headers_are_fixed_and_service_worker_scope_is_root(self):
+        for path, mime in (("/", "text/html"), ("/static/app.js", "text/javascript"),
+                           ("/static/manifest.webmanifest", "application/manifest+json"),
+                           ("/sw.js", "text/javascript")):
+            conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=10)
+            conn.request("GET", path)
+            response = conn.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), mime + "; charset=utf-8")
+            self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+            if path == "/sw.js":
+                self.assertEqual(response.getheader("Service-Worker-Allowed"), "/")
+            conn.close()
+
+    def test_measured_split_arrays_sync_and_invalid_arrays_do_not(self):
+        session = self.signup()
+        log = {"client_id": "split-event", "date": date.today().isoformat(), "status": "completed",
+               "duration": 40, "rpe": 6, "metrics": {"splits": [240, 245, 238]}}
+        self.assertEqual(self.request("/api/workouts/log", "POST", log, session)[0], 200)
+        with server.connect() as db:
+            self.assertEqual(server.context(db, session["user"]["id"], session["csrf_token"])["logs"][0]["metrics"]["splits"], [240, 245, 238])
+        log.update(client_id="bad-split", metrics={"splits": [{"unexpected": 240}]})
+        self.assertEqual(self.request("/api/workouts/log", "POST", log, session)[0], 400)
+
+    def test_pain_when_skipping_a_session_still_updates_current_readiness(self):
+        session = self.signup()
+        self.assertEqual(self.request("/api/workouts/log", "POST", {"client_id": "pain-skip",
+            "date": date.today().isoformat(), "status": "skipped", "pain": 8}, session)[0], 200)
+        with server.connect() as db:
+            self.assertEqual(server.context(db, session["user"]["id"], session["csrf_token"])["checkin"]["pain"], 8)
+
+    def test_simulation_scaling_flags_survive_persistence(self):
+        session = self.signup()
+        sim = {"date": "2026-09-06", "total_seconds": 3000, "scaled": True,
+               "comparable": False, "full_distance": False, "difficulty": 6}
+        self.assertEqual(self.request("/api/simulations", "POST", sim, session)[0], 200)
+        with server.connect() as db:
+            result = server.context(db, session["user"]["id"], session["csrf_token"])["simulations"][-1]
+            self.assertTrue(result["scaled"])
+            self.assertFalse(result["comparable"])
+            self.assertFalse(result["full_distance"])
+        sim.update(date="2026-09-07", scaled="yes")
+        self.assertEqual(self.request("/api/simulations", "POST", sim, session)[0], 400)
+
+    def test_class_override_preserves_simulation_recovery_without_readiness_warning(self):
+        session = self.signup()
+        start = date.today()
+        simulation = start + timedelta(days=37)
+        self.assertEqual(self.request("/api/race", "PUT", {"plan_start": start.isoformat(),
+            "simulation_date": simulation.isoformat(), "date": (start + timedelta(days=55)).isoformat()}, session)[0], 200)
+        recovery_day = (simulation + timedelta(days=1)).isoformat()
+        self.assertEqual(self.request("/api/workouts/external", "POST", {"date": recovery_day,
+            "title": "High-volume class", "duration": 90, "intensity": "hard", "main": ["Maximal efforts"]}, session)[0], 200)
+        status, dashboard = self.request("/api/dashboard", session=session)
+        self.assertEqual(status, 200, dashboard)
+        workout = next(w for w in dashboard["plan"] if w["date"] == recovery_day)
+        self.assertIn(workout["type"], ("recovery", "class"))
+        self.assertNotEqual(workout["intensity"], "hard")
+        self.assertLessEqual(workout["duration"], 25)
+        self.assertNotIn("Maximal efforts", workout["main"])
 
 
 if __name__ == "__main__":

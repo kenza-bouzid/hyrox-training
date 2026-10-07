@@ -51,6 +51,8 @@ and recent history. The service worker caches the application shell, while
 IndexedDB stores the signed-in athlete's data and pending workout events.
 Cached workouts can be viewed and logged without a signal; pending saves retry
 on reconnection. Check the sync indicator before signing out.
+Each queued save is bound to its originating athlete and is rejected if the
+authenticated account changes during replay.
 
 Authenticated API responses are **not** put in the service-worker cache.
 Device data is scoped to the last signed-in account. Signing out clears private
@@ -106,6 +108,12 @@ No password-reset tokens are logged by HTTP requests.
   simulation analytics, race projections, allocation and coaching explanations.
 - `static/`: dependency-free responsive UI, IndexedDB offline queue, PWA shell.
 - `tests/`: standard-library unit and HTTP integration tests.
+
+Only comparable, full-distance simulations are race-projection anchors. Mark
+scaled efforts accordingly: they remain in history without being presented as
+full-race improvements. Comparable recent measurements can make a bounded,
+explained adjustment; the displayed range is a heuristic, not a scientific
+confidence interval.
 
 Planned workouts, completions, readiness, personal nutrition notes, team
 simulations, station specifications and coach adjustments have separate database

@@ -77,7 +77,10 @@ def _affirmed(value):
 
 def _completed(logs, start=None, end=None):
     return [log for log in logs if isinstance(log, dict)
-            and log.get("status") == "completed"
+            and (log.get("status") == "completed" or
+                 log.get("status") == "modified"
+                 and _number(log.get("duration"), 0, 0, 1440) > 0
+                 and _number(log.get("rpe"), 0, 0, 10) >= 1)
             and _date(log.get("date")) is not None
             and (start is None or _date(log["date"]) >= start)
             and (end is None or _date(log["date"]) <= end)]
@@ -675,7 +678,7 @@ def weekly_summary(logs, plan, today=None):
             "hard_sessions": sum(_number(x.get("rpe"), 0, 0, 10) >= 7 for x in recorded),
             "missed": len(missed - completed_dates),
             "remaining_due": len(due - completed_dates),
-            "message": "Only recorded completed sessions contribute to load. Missed sessions are not made up."}
+            "message": "Recorded completed sessions and exercised modified sessions contribute to load. Missed sessions are not made up."}
 
 
 def coach_reply(question, profile, race, logs, checkin, simulations):

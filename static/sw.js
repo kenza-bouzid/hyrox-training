@@ -74,36 +74,63 @@ async function store(db, name, operation, value) {
     tx.onabort = () => reject(tx.error);
   });
 }
+async function updateIfActive(db, userId, record) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('private', 'readwrite');
+    const target = tx.objectStore('private');
+    const active = target.get('active_user');
+    active.onsuccess = () => {
+      if (String(active.result?.value) === String(userId)) target.put(record);
+    };
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
 async function replay() {
   const db = await openDB();
+  let userId;
+  let failure = '';
   try {
     const active = await store(db, 'private', 'get', 'active_user');
     if (!active?.value) return;
+    userId = String(active.value);
     const response = await fetch('/api/session', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
     if (!response.ok) throw new Error('Authentication required; queued workouts retained.');
     const session = await response.json();
     if (!session.user || String(session.user.id) !== String(active.value) || !session.csrf_token) throw new Error('Account mismatch; queued workouts retained.');
-    await store(db, 'private', 'put', { key: `session:${active.value}`, value: session });
     const queue = (await store(db, 'queue', 'all')).filter(item => String(item.user_id) === String(active.value)).sort((a, b) => a.created_at.localeCompare(b.created_at));
     for (const item of queue) {
+      if (!await store(db, 'queue', 'get', item.client_id)) continue;
       const current = await store(db, 'private', 'get', 'active_user');
       if (String(current?.value) !== String(active.value)) throw new Error('Account changed; remaining queue retained.');
       const saved = await fetch('/api/workouts/log', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-CSRF-Token': session.csrf_token }, body: JSON.stringify(item.payload) });
       if (!saved.ok) throw new Error(`Sync failed (${saved.status}); queued workout retained.`);
+      const result = await saved.json().catch(() => ({}));
+      const cached = await store(db, 'private', 'get', `dashboard:${userId}`);
+      if (cached?.value) {
+        const confirmed = result.log || { ...item.payload, id: item.client_id };
+        cached.value.logs = [...(cached.value.logs || []).filter(log => log.date !== confirmed.date), confirmed].sort((a, b) => a.date.localeCompare(b.date));
+        await updateIfActive(db, userId, cached);
+      }
       await store(db, 'queue', 'delete', item.client_id);
     }
+    await updateIfActive(db, userId, { key: `sync_error:${userId}`, value: '' });
     const dashboardResponse = await fetch('/api/dashboard', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
     if (dashboardResponse.ok) {
       const dashboard = await dashboardResponse.json();
-      const current = await store(db, 'private', 'get', 'active_user');
-      if (String(current?.value) === String(active.value)) await store(db, 'private', 'put', { key: `dashboard:${active.value}`, value: dashboard, savedAt: new Date().toISOString() });
+      if (!dashboard.user || String(dashboard.user.id) === userId) await updateIfActive(db, userId, { key: `dashboard:${userId}`, value: dashboard, savedAt: new Date().toISOString() });
     }
+  } catch (error) {
+    failure = error.message || 'Background sync failed. Your workouts are retained.';
+    if (userId) await updateIfActive(db, userId, { key: `sync_error:${userId}`, value: failure });
+    throw error;
   } finally {
     db.close();
     const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    clients.forEach(client => client.postMessage({ type: 'QUEUE_CHANGED' }));
+    clients.forEach(client => client.postMessage({ type: 'QUEUE_CHANGED', error: failure, userId }));
   }
 }
 self.addEventListener('sync', event => {
-  if (event.tag === 'pair-workout-sync') event.waitUntil(replay());
+  if (event.tag === 'pair-workout-sync') event.waitUntil(self.navigator?.locks?.request ? self.navigator.locks.request('pair-private-sync', replay) : replay());
 });

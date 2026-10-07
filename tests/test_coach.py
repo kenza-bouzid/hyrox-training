@@ -240,6 +240,8 @@ class CoachTests(unittest.TestCase):
         logs[0]["metrics"] = {"run_seconds": 1600, "run_distance_km": 8, "comparable": "yes"}
         self.assertEqual(coach.projection(RACE, [simulation], logs, {})["seconds"], 4124)
         self.assertEqual(coach.projection(RACE, [dict(simulation, scaled=True)], [], {})["status"], "baseline")
+        self.assertEqual(coach.projection(RACE, [dict(simulation, comparable=False)], [], {})["status"], "baseline")
+        self.assertEqual(coach.projection(RACE, [dict(simulation, full_distance=False)], [], {})["status"], "baseline")
 
     def test_custom_race_outside_default_window_is_actual_race_day(self):
         race = dict(RACE, date="2026-12-15")
@@ -355,6 +357,23 @@ class CoachTests(unittest.TestCase):
         self.assertEqual(result["hyrox_sessions"], 1)
         self.assertEqual(result["distance_km"], 2.5)
         self.assertEqual(result["running_sessions"], 1)
+
+    def test_exercised_modified_sessions_count_load_and_pain(self):
+        logs = [{"date": "2026-10-08", "status": "modified", "duration": 20,
+                 "rpe": 5, "pain": 8},
+                {"date": "2026-10-08", "status": "modified", "duration": 0,
+                 "rpe": 8, "pain": 10},
+                {"date": "2026-10-08", "status": "modified", "duration": 20,
+                 "rpe": 0, "pain": 10}]
+        state = coach.readiness(logs, {}, self.today)
+        self.assertEqual(state["color"], "red")
+        self.assertEqual(state["load_7d"], 100)
+        plan = coach.generate_plan(self.profile, RACE, [], {}, self.today)
+        summary = coach.weekly_summary(logs, plan, self.today)
+        self.assertEqual(summary["completed"], 1)
+        self.assertEqual(summary["duration"], 20)
+        self.assertEqual(summary["load"], 100)
+        self.assertEqual(coach.readiness(logs[1:], {}, self.today)["color"], "green")
 
 
 if __name__ == "__main__":
