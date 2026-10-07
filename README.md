@@ -65,6 +65,10 @@ workers require HTTPS except on localhost. First-time signup, reset, team
 updates, simulations and conversational coaching require connectivity; workout
 viewing and logging are the offline core.
 
+When deploying changes to frontend assets, update `SHELL_CACHE` in
+`static/sw.js` too. This triggers an updated shell download for existing installs;
+never add authenticated API URLs to that cache.
+
 ## Deployment and password reset
 
 Run behind a TLS-terminating reverse proxy. The included Python HTTP server is

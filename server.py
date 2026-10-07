@@ -32,13 +32,13 @@ DEFAULT_RACE = {
     "name": "HYROX London", "date": "2026-12-02", "target_seconds": 3900,
     "baseline_seconds": 4252, "simulation_date": "2026-11-14", "plan_start": "2026-10-08",
 }
-STATIC_TYPES = {
-    "/index.html": "text/html",
-    "/app.js": "text/javascript",
-    "/style.css": "text/css",
-    "/sw.js": "text/javascript",
-    "/manifest.webmanifest": "application/manifest+json",
-    "/icon.svg": "image/svg+xml",
+STATIC_ASSETS = {
+    "/index.html": (ROOT / "static" / "index.html", "text/html"),
+    "/app.js": (ROOT / "static" / "app.js", "text/javascript"),
+    "/style.css": (ROOT / "static" / "style.css", "text/css"),
+    "/sw.js": (ROOT / "static" / "sw.js", "text/javascript"),
+    "/manifest.webmanifest": (ROOT / "static" / "manifest.webmanifest", "application/manifest+json"),
+    "/icon.svg": (ROOT / "static" / "icon.svg", "image/svg+xml"),
 }
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -501,11 +501,16 @@ class Handler(BaseHTTPRequestHandler):
                 if key in data:
                     profile[key] = text(data[key], key, 4000)
             if "easy_pace" in data:
+                profile["easy_pace_override"] = True
                 pace = re.match(r"^(\d{1,2}):([0-5]\d)", profile["easy_pace"])
                 if pace:
                     profile["easy_pace_seconds"] = number(int(pace[1]) * 60 + int(pace[2]), "easy pace seconds/km", 180, 1200)
+                else:
+                    profile.pop("easy_pace_seconds", None)
             if "easy_pace_seconds" in data:
                 profile["easy_pace_seconds"] = number(data["easy_pace_seconds"], "easy pace seconds/km", 180, 1200)
+                if "easy_pace" not in data:
+                    profile["easy_pace_override"] = False
             if "benchmark_seconds" in data:
                 profile["benchmark_seconds"] = number(data["benchmark_seconds"], "10K benchmark seconds", 600, 14400)
             db.execute("UPDATE athletes SET profile=? WHERE user_id=?", (encoded(profile), user_id))
@@ -625,15 +630,15 @@ class Handler(BaseHTTPRequestHandler):
             path = path[len("/static"):]
         path = "/index.html" if path == "/" else path
         # Explicit allowlist prevents traversal and exposing source/database files.
-        if path not in STATIC_TYPES:
+        if path not in STATIC_ASSETS:
             return self.respond(404, {"error": "Not found."})
-        file = ROOT / "static" / path[1:]
+        file, content_type = STATIC_ASSETS[path]
         if not file.is_file():
             return self.respond(404, {"error": "Not found."})
         content = file.read_bytes()
         self.send_response(200)
         self.headers_common()
-        self.send_header("Content-Type", STATIC_TYPES[path] + "; charset=utf-8")
+        self.send_header("Content-Type", content_type + "; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-cache")
         if path == "/sw.js":

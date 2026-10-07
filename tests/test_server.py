@@ -242,6 +242,14 @@ class APITest(unittest.TestCase):
         with server.connect() as db:
             self.assertEqual(server.context(db, session["user"]["id"], session["csrf_token"])["checkin"]["pain"], 8)
 
+    def test_textual_easy_pace_replaces_seeded_numeric_guidance(self):
+        session = self.signup()
+        self.assertEqual(self.request("/api/profile", "PUT", {"easy_pace": "Conversational effort only"}, session)[0], 200)
+        profile = self.request("/api/session", session=session)[1]["profile"]
+        self.assertTrue(profile["easy_pace_override"])
+        self.assertNotIn("easy_pace_seconds", profile)
+        self.assertEqual(profile["benchmark_seconds"], 2645)
+
     def test_simulation_scaling_flags_survive_persistence(self):
         session = self.signup()
         sim = {"date": "2026-09-06", "total_seconds": 3000, "scaled": True,

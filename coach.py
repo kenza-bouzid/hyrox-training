@@ -174,6 +174,8 @@ def readiness(logs, checkin, today=None):
 
 def _pace(profile):
     declared = str(profile.get("easy_pace") or "")
+    if profile.get("easy_pace_override") and declared.strip():
+        return declared
     if "/km" in declared:
         return declared
     explicit = _number(profile.get("easy_pace_seconds"), minimum=180, maximum=1200)

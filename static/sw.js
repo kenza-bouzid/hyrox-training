@@ -1,6 +1,6 @@
 'use strict';
 
-const SHELL_CACHE = 'pair-shell-v1';
+const SHELL_CACHE = 'pair-shell-v2';
 const SHELL = ['/', '/static/index.html', '/static/app.js', '/static/style.css', '/static/icon.svg', '/static/manifest.webmanifest'];
 const STATIC_PATHS = new Set(SHELL.filter(path => path !== '/'));
 

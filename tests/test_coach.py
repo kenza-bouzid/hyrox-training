@@ -375,6 +375,17 @@ class CoachTests(unittest.TestCase):
         self.assertEqual(summary["load"], 100)
         self.assertEqual(coach.readiness(logs[1:], {}, self.today)["color"], "green")
 
+    def test_textual_easy_pace_override_wins_over_seeded_numeric_pace(self):
+        self.assertEqual(self.profile["easy_pace_seconds"], 315)
+        self.profile.update(easy_pace="Conversational effort with comfortable breathing",
+                            easy_pace_override=True)
+        self.assertEqual(coach._pace(self.profile), self.profile["easy_pace"])
+        plan = coach.generate_plan(self.profile, RACE, [], {}, self.today)
+        thursday = next(x for x in plan if x["type"] == "hyrox")
+        instructions = " ".join(thursday["main"])
+        self.assertIn("Easy pace: Conversational effort with comfortable breathing", instructions)
+        self.assertNotIn("5:15", instructions)
+
 
 if __name__ == "__main__":
     unittest.main()
