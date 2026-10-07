@@ -24,6 +24,38 @@ Use `DATABASE_PATH` to choose a persistent volume. Back up this database using
 SQLite's backup API (including live WAL data correctly); do not copy only the
 main database file while the app is writing.
 
+## Test in GitHub Codespaces
+
+1. Open this pull request's branch on GitHub (not `main` until it is merged).
+2. Select **Code → Codespaces → Create codespace on this branch**. Codespaces
+   usage is subject to your account's quota and billing settings.
+3. Wait for the development container to finish starting. It includes Python
+   3.12 and automatically starts the app on port **8000**.
+4. If the browser does not open automatically, open the **Ports** tab and click
+   the forwarded address for port 8000. Keep port visibility **Private**.
+   Use that HTTPS address, not `localhost:8000` on your own computer.
+5. Create a test account, inspect the dashboard and training plan, log a workout,
+   then refresh to check it persists. To test the shared team, create the second
+   athlete's account using the invitation code from the Team screen.
+6. To test offline workouts, first sign in and load the plan, then select
+   **Offline** in browser developer tools' Network tab. View and log a cached
+   workout, reconnect, and check that the sync indicator clears.
+
+Run the automated tests in the Codespace terminal:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Server output is in `/tmp/hyrox-coach.log`. The startup command configures
+`PUBLIC_URL` and `ALLOWED_HOSTS` for the Codespace's forwarded HTTPS address so
+signup, cookies, and origin checks work without disabling security protections.
+Stopping and restarting the Codespace restarts the app; its database remains in
+`data/coach.sqlite3`. Deleting the Codespace deletes that data, so use test data
+and back up anything you want to keep. This is a development preview, not a
+production deployment. Creating the Codespace requires your GitHub account;
+the configuration does not provision one automatically.
+
 ## Features
 
 - Signup/login/logout and one-use, expiring password reset.
