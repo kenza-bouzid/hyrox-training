@@ -1,6 +1,6 @@
 'use strict';
 
-const SHELL_CACHE = 'pair-shell-v2';
+const SHELL_CACHE = 'pair-shell-v3';
 const SHELL = ['/', '/static/index.html', '/static/app.js', '/static/style.css', '/static/icon.svg', '/static/manifest.webmanifest'];
 const STATIC_PATHS = new Set(SHELL.filter(path => path !== '/'));
 
@@ -87,6 +87,8 @@ async function updateIfActive(db, userId, record) {
     tx.onabort = () => reject(tx.error);
   });
 }
+const logKey = log => log.kind === 'additional' ? `additional:${log.session_id}` : `planned:${log.date}`;
+const mergeLog = (saved, log) => [...saved.filter(item => logKey(item) !== logKey(log)), log].sort((a, b) => a.date.localeCompare(b.date) || String(a.session_time || '').localeCompare(String(b.session_time || '')));
 async function replay() {
   const db = await openDB();
   let userId;
@@ -109,8 +111,8 @@ async function replay() {
       const result = await saved.json().catch(() => ({}));
       const cached = await store(db, 'private', 'get', `dashboard:${userId}`);
       if (cached?.value) {
-        const confirmed = result.log || { ...item.payload, id: item.client_id };
-        cached.value.logs = [...(cached.value.logs || []).filter(log => log.date !== confirmed.date), confirmed].sort((a, b) => a.date.localeCompare(b.date));
+        const confirmed = result.log || { ...item.payload, id: item.payload.session_id || `planned:${item.payload.date}` };
+        cached.value.logs = mergeLog(cached.value.logs || [], confirmed);
         await updateIfActive(db, userId, cached);
       }
       await store(db, 'queue', 'delete', item.client_id);

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS auth_limits(key TEXT PRIMARY KEY, count INTEGER NOT N
 CREATE TABLE IF NOT EXISTS training_plans(user_id TEXT PRIMARY KEY REFERENCES users(id), race_config TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workouts(user_id TEXT NOT NULL REFERENCES users(id), date TEXT NOT NULL, planned TEXT NOT NULL, PRIMARY KEY(user_id,date));
 CREATE TABLE IF NOT EXISTS workout_completions(user_id TEXT NOT NULL REFERENCES users(id), date TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(user_id,date));
+CREATE TABLE IF NOT EXISTS additional_workouts(user_id TEXT NOT NULL REFERENCES users(id), session_id TEXT NOT NULL, date TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(user_id,session_id));
 CREATE TABLE IF NOT EXISTS mutation_keys(user_id TEXT NOT NULL REFERENCES users(id), client_id TEXT NOT NULL, PRIMARY KEY(user_id,client_id));
 CREATE TABLE IF NOT EXISTS readiness_logs(id INTEGER PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS simulation_results(id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id), date TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(team_id,date));
@@ -201,6 +202,8 @@ def session_data(db, user_id, csrf):
 def context(db, user_id, csrf):
     state = session_data(db, user_id, csrf)
     logs = [json.loads(r[0]) for r in db.execute("SELECT data FROM workout_completions WHERE user_id=? ORDER BY date", (user_id,))]
+    logs.extend(json.loads(r[0]) for r in db.execute("SELECT data FROM additional_workouts WHERE user_id=? ORDER BY date,session_id", (user_id,)))
+    logs.sort(key=lambda log: (log["date"], log.get("session_time", ""), log.get("session_id", "")))
     row = db.execute("SELECT data,created_at FROM readiness_logs WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
     # Old readiness is not evidence of current readiness.
     checkin = json.loads(row["data"]) if row and row["created_at"][:10] == date.today().isoformat() else {}
@@ -444,13 +447,24 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("athlete_id") != user_id:
                 raise Invalid("Workout account changed. Sign in as the athlete who recorded it before retrying.")
             client_id = text(data.get("client_id"), "client ID", 100, True)
-            if db.execute("SELECT 1 FROM mutation_keys WHERE user_id=? AND client_id=?", (user_id, client_id)).fetchone():
-                return {"ok": True, "duplicate": True}
+            kind = data.get("kind", "planned")
+            if kind not in ("planned", "additional"):
+                raise Invalid("Invalid session kind.")
             day = iso_date(data.get("date"))
+            session_id = text(data.get("session_id"), "session ID", 100, True) if kind == "additional" else "planned:" + day
+            if db.execute("SELECT 1 FROM mutation_keys WHERE user_id=? AND client_id=?", (user_id, client_id)).fetchone():
+                row = db.execute("SELECT data FROM additional_workouts WHERE user_id=? AND session_id=?", (user_id, session_id)).fetchone() if kind == "additional" else db.execute("SELECT data FROM workout_completions WHERE user_id=? AND date=?", (user_id, day)).fetchone()
+                return {"ok": True, "duplicate": True, "log": json.loads(row[0]) if row else None}
+            # Allow one day for athletes whose local date is ahead of the server's.
+            if kind == "additional" and day > (date.today() + timedelta(days=1)).isoformat():
+                raise Invalid("Record additional workouts on or after their session date.")
             status = data.get("status")
             if status not in ("completed", "started", "skipped", "modified"):
                 raise Invalid("Invalid workout status.")
-            log = {"id": client_id, "client_id": client_id, "date": day, "status": status}
+            log = {"id": session_id, "session_id": session_id, "kind": kind, "client_id": client_id, "date": day, "status": status}
+            if kind == "additional":
+                log["title"] = text(data.get("title"), "session title", 150, True)
+                log["type"] = text(data.get("type"), "session type", 60, True).lower()
             for key, high in (("duration", 600), ("rpe", 10), ("energy", 10), ("soreness", 10), ("sleep", 24), ("pain", 10)):
                 value = data.get(key, 0 if key in ("duration", "rpe") else None)
                 log[key] = None if value is None and key not in ("duration", "rpe") else number(value, key, 0, high)
@@ -459,6 +473,8 @@ class Handler(BaseHTTPRequestHandler):
             for key in ("notes", "modification", "pre_session_food", "glucose_notes"):
                 log[key] = text(data.get(key, ""), key, 4000)
             log["session_time"] = text(data.get("session_time", ""), "session time", 30)
+            if kind == "additional" and log["session_time"] and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", log["session_time"]):
+                raise Invalid("Use a session time in HH:MM format.")
             metrics = data.get("metrics", {})
             if not isinstance(metrics, dict) or len(metrics) > 40:
                 raise Invalid("Invalid session metrics.")
@@ -475,9 +491,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise Invalid("Metrics must be numbers, text, or measured numeric split arrays.")
             log["metrics"] = metrics
             db.execute("INSERT INTO mutation_keys VALUES (?,?)", (user_id, client_id))
-            db.execute("INSERT INTO workout_completions VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET data=excluded.data", (user_id, day, encoded(log)))
-            nutrition = {k: log[k] for k in ("session_time", "pre_session_food", "glucose_notes")}
-            db.execute("INSERT INTO nutrition_logs VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET data=excluded.data", (user_id, day, encoded(nutrition)))
+            if kind == "additional":
+                db.execute("INSERT INTO additional_workouts VALUES (?,?,?,?) ON CONFLICT(user_id,session_id) DO UPDATE SET date=excluded.date,data=excluded.data", (user_id, session_id, day, encoded(log)))
+            else:
+                db.execute("INSERT INTO workout_completions VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET data=excluded.data", (user_id, day, encoded(log)))
+                nutrition = {k: log[k] for k in ("session_time", "pre_session_food", "glucose_notes")}
+                db.execute("INSERT INTO nutrition_logs VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET data=excluded.data", (user_id, day, encoded(nutrition)))
             if day == date.today().isoformat():
                 signals = {k: log[k] for k in ("sleep", "soreness", "pain") if log[k] is not None}
                 if log["energy"] is not None:

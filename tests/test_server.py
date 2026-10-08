@@ -37,7 +37,7 @@ class APITest(unittest.TestCase):
         with server.connect() as db:
             for table in ("coach_adjustments", "nutrition_logs", "external_activities", "team_strategy",
                           "station_specs", "simulation_results", "readiness_logs", "mutation_keys",
-                          "workout_completions", "workouts", "training_plans", "reset_tokens",
+                          "additional_workouts", "workout_completions", "workouts", "training_plans", "reset_tokens",
                           "sessions", "auth_limits", "team_members", "athletes", "races", "users", "teams"):
                 db.execute(f"DELETE FROM {table}")
 
@@ -124,6 +124,107 @@ class APITest(unittest.TestCase):
         status, response = self.request("/api/password-reset", "POST", {"email": "absent@example.test"})
         self.assertEqual(status, 200)
         self.assertNotIn("token", response)
+
+    def test_additional_sessions_preserve_plan_and_update_by_identity(self):
+        session = self.signup()
+        day = date.today().isoformat()
+        planned = {"client_id": "planned-1", "date": day, "status": "completed",
+                   "duration": 40, "rpe": 5, "notes": "Planned work"}
+        self.assertEqual(self.request("/api/workouts/log", "POST", planned, session)[0], 200)
+        extras = []
+        for i in range(2):
+            payload = {"kind": "additional", "session_id": f"extra-{i}", "client_id": f"create-{i}",
+                       "date": day, "status": "completed", "title": f"Extra session {i}",
+                       "type": "run" if i == 0 else "class", "duration": 20 + i * 10, "rpe": 6,
+                       "session_time": f"{8 + i * 10:02d}:30", "notes": "Second workout"}
+            extras.append(payload)
+            status, result = self.request("/api/workouts/log", "POST", payload, session)
+            self.assertEqual(status, 200, result)
+            self.assertEqual(result["log"]["id"], payload["session_id"])
+            self.assertTrue(self.request("/api/workouts/log", "POST", payload, session)[1]["duplicate"])
+        dashboard = self.request("/api/dashboard", session=session)[1]
+        self.assertEqual(len(dashboard["logs"]), 3)
+        self.assertEqual(dashboard["weekly"]["completed"], 3)
+        self.assertEqual(dashboard["weekly"]["duration"], 90)
+        self.assertEqual(dashboard["weekly"]["load"], 500)
+        self.assertEqual(dashboard["readiness"]["load_7d"], 500)
+        old_extra = dict(extras[0])
+        extras[0].update(client_id="edit-extra", duration=25, title="Updated extra",
+                         date=(date.today() - timedelta(days=1)).isoformat())
+        self.assertEqual(self.request("/api/workouts/log", "POST", extras[0], session)[0], 200)
+        duplicate = self.request("/api/workouts/log", "POST", old_extra, session)[1]
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["log"]["duration"], 25)
+        planned.update(client_id="planned-2", duration=45)
+        self.assertEqual(self.request("/api/workouts/log", "POST", planned, session)[0], 200)
+        with server.connect() as db:
+            logs = server.context(db, session["user"]["id"], session["csrf_token"])["logs"]
+            self.assertEqual(len(logs), 3)
+            self.assertEqual(next(log for log in logs if log["kind"] == "planned")["duration"], 45)
+            extra = next(log for log in logs if log.get("session_id") == "extra-0")
+            self.assertEqual(extra["date"], extras[0]["date"])
+            self.assertEqual(extra["title"], "Updated extra")
+
+    def test_additional_sessions_are_athlete_scoped(self):
+        ken = self.signup()
+        rob = self.signup("rob@example.test", "Rob", ken["team"]["invite_code"])
+        payload = {"kind": "additional", "session_id": "same-session-id", "client_id": "same-mutation",
+                   "date": date.today().isoformat(), "title": "Kenza run", "type": "run",
+                   "status": "completed", "duration": 30, "rpe": 5}
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, ken)[0], 200)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "athlete_id": ken["user"]["id"]}, rob)[0], 400)
+        self.assertEqual(self.request("/api/dashboard", session=rob)[1]["logs"], [])
+        payload.update(title="Rob session", duration=60)
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, rob)[0], 200)
+        self.assertEqual(self.request("/api/dashboard", session=ken)[1]["logs"][0]["duration"], 30)
+        self.assertEqual(self.request("/api/dashboard", session=rob)[1]["logs"][0]["duration"], 60)
+
+    def test_additional_schema_startup_retains_legacy_data(self):
+        session = self.signup()
+        legacy = {"client_id": "legacy", "date": "2026-10-07", "status": "completed", "duration": 40, "rpe": 5}
+        self.assertEqual(self.request("/api/workouts/log", "POST", legacy, session)[0], 200)
+        with server.connect() as db:
+            db.execute("DROP TABLE additional_workouts")
+            old = {"id": "legacy", **legacy}
+            db.execute("UPDATE workout_completions SET data=?", (server.encoded(old),))
+        server.initialize()
+        self.assertEqual(self.request("/api/dashboard", session=session)[1]["logs"], [old])
+        self.assertTrue(self.request("/api/workouts/log", "POST", legacy, session)[1]["duplicate"])
+        extra = {**legacy, "client_id": "new-extra", "kind": "additional", "session_id": "new-session",
+                 "title": "Extra workout", "type": "recovery"}
+        self.assertEqual(self.request("/api/workouts/log", "POST", extra, session)[0], 200)
+        server.initialize()
+        server.initialize()
+        self.assertEqual(len(self.request("/api/dashboard", session=session)[1]["logs"]), 2)
+
+    def test_invalid_additional_input_does_not_reserve_mutation(self):
+        session = self.signup()
+        payload = {"kind": "additional", "session_id": "extra", "client_id": "retry-after-error",
+                   "date": date.today().isoformat(), "title": "Evening run", "type": "run",
+                   "status": "completed", "duration": 30, "rpe": 5}
+        for invalid in ({"kind": "other"}, {"session_id": ""}, {"title": ""}, {"type": ""},
+                        {"date": "2026-02-30"}, {"date": (date.today() + timedelta(days=2)).isoformat()},
+                        {"session_time": "25:00"}, {"duration": 0}, {"rpe": 0}, {"duration": 601},
+                        {"rpe": float("nan")}, {"title": "x" * 151}):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, **invalid}, session)[0], 400)
+        self.assertEqual(self.request("/api/dashboard", session=session)[1]["logs"], [])
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, session)[0], 200)
+
+    def test_additional_session_date_allows_one_day_timezone_boundary(self):
+        session = self.signup()
+        today = date.today()
+        payload = {"kind": "additional", "session_id": "timezone-extra", "client_id": "timezone-mutation",
+                   "title": "Local morning run", "type": "run", "status": "completed", "duration": 30, "rpe": 5}
+        for days_ahead in (2, 3):
+            with self.subTest(days_ahead=days_ahead):
+                future = (today + timedelta(days=days_ahead)).isoformat()
+                self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "date": future}, session)[0], 400)
+        tomorrow = (today + timedelta(days=1)).isoformat()
+        status, result = self.request("/api/workouts/log", "POST", {**payload, "date": tomorrow}, session)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["log"]["date"], tomorrow)
+        self.assertEqual(self.request("/api/dashboard", session=session)[1]["logs"][0]["date"], tomorrow)
 
     def test_invalid_input_and_static_isolation(self):
         session = self.signup()

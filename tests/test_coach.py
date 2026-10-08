@@ -56,6 +56,38 @@ class CoachTests(unittest.TestCase):
                                      {}, self.today)
         self.assertEqual(clean, missed)
 
+    def test_same_day_additional_sessions_count_without_completing_plan(self):
+        logs = [{"kind": "additional", "session_id": "am", "date": "2026-10-08", "type": "run",
+                 "status": "completed", "duration": 30, "rpe": 8, "metrics": {"distance_km": 5}},
+                {"kind": "additional", "session_id": "pm", "date": "2026-10-08", "type": "class",
+                 "status": "modified", "duration": 40, "rpe": 8}]
+        plan = [{"date": "2026-10-08", "duration": 60, "type": "hyrox"}]
+        summary = coach.weekly_summary(logs, plan, self.today)
+        self.assertEqual(summary["completed"], 2)
+        self.assertEqual(summary["duration"], 70)
+        self.assertEqual(summary["load"], 560)
+        self.assertEqual(summary["remaining_due"], 1)
+        self.assertEqual(summary["sessions_by_type"], {"run": 1, "class": 1})
+        self.assertEqual(summary["distance_km"], 5)
+        self.assertEqual(coach.readiness(logs, {}, self.today)["load_7d"], 560)
+        adjusted = coach.generate_plan(self.profile, RACE, logs, {"pain": 8}, self.today)
+        self.assertEqual(adjusted[0]["duration"], 0)
+        self.assertIn("adjustment", adjusted[0])
+        logs.append({"date": "2026-10-08", "status": "completed", "duration": 60, "rpe": 5})
+        self.assertEqual(coach.weekly_summary(logs, plan, self.today)["remaining_due"], 0)
+        logs.append({"kind": "additional", "date": "2026-10-08", "status": "modified", "duration": 0, "rpe": 0})
+        self.assertEqual(coach.weekly_summary(logs, plan, self.today)["completed"], 3)
+
+    def test_additional_work_never_infers_type_or_progression_from_date(self):
+        log = {"kind": "additional", "date": "2026-10-07", "status": "completed", "duration": 30, "rpe": 5}
+        state = {"color": "green"}
+        self.assertEqual(coach._progression([log], "strength", self.today, self.today, state), 0)
+        self.assertEqual(coach._progression([{**log, "type": "run"}], "strength", self.today, self.today, state), 0)
+        self.assertEqual(coach._progression([{**log, "type": "strength"}], "strength", self.today, self.today, state), 1)
+        summary = coach.weekly_summary([log], [{"date": log["date"], "type": "strength", "duration": 60}], self.today)
+        self.assertEqual(summary["sessions_by_type"], {"unknown": 1})
+        self.assertEqual(summary["remaining_due"], 1)
+
     def test_external_classes_and_athlete_pace(self):
         self.profile["optional_activities"] = ["BodyAttack", "tennis"]
         self.profile["benchmark_seconds"] = 3000

@@ -24,6 +24,17 @@ Use `DATABASE_PATH` to choose a persistent volume. Back up this database using
 SQLite's backup API (including live WAL data correctly); do not copy only the
 main database file while the app is writing.
 
+### Additional workouts
+
+Use **Log additional workout** on Home, Plan, Progress, or a workout's detail
+page to record a second (or third) session, including on dates without a plan.
+Give each session its own title, type, date, duration, RPE, optional time and
+notes. Find and edit it in **Progress → Session history**. Additional sessions
+save offline and sync with your account, just like planned workout logs.
+They all contribute to training totals, weekly load and readiness, but do not
+replace or mark the scheduled workout complete. **Add / edit class** still
+replaces the planned session; choose an additional workout to keep both.
+
 ## Test in GitHub Codespaces
 
 1. Open this pull request's branch on GitHub (not `main` until it is merged).

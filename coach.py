@@ -211,7 +211,7 @@ def _progression(logs, kind, day, today, state):
     for log in _completed(logs, end=min(day - timedelta(days=1), today)):
         metrics = log.get("metrics") if isinstance(log.get("metrics"), dict) else {}
         recorded_kind = log.get("type", metrics.get("type"))
-        if recorded_kind == kind or recorded_kind is None and _date(log["date"]).weekday() == weekday:
+        if recorded_kind == kind or recorded_kind is None and log.get("kind") != "additional" and _date(log["date"]).weekday() == weekday:
             prior.append(log)
     prior.sort(key=lambda x: _date(x["date"]))
     eligible = [x for x in prior if _number(x.get("rpe"), minimum=0, maximum=7) is not None
@@ -405,7 +405,7 @@ def generate_plan(profile, race, logs, checkin, today=None, stations=None):
         else:
             accepted.append(_date(workout["date"]))
     # Short-lived check-ins reduce the next week's risk, not an entire week of rest.
-    completed_dates = {str(x["date"])[:10] for x in _completed(logs, end=today)}
+    completed_dates = {str(x["date"])[:10] for x in _completed(logs, end=today) if x.get("kind") != "additional"}
     for workout in plan:
         day = _date(workout["date"])
         if day.isoformat() in completed_dates:
@@ -649,12 +649,12 @@ def weekly_summary(logs, plan, today=None):
     recorded = _completed(logs, start, today)
     sessions = [x for x in plan if start <= _date(x.get("date"), date.min) <= end]
     due = {x["date"] for x in sessions if _date(x["date"]) <= today and x.get("duration", 0) > 0}
-    completed_dates = {str(x["date"])[:10] for x in recorded}
+    completed_dates = {str(x["date"])[:10] for x in recorded if x.get("kind") != "additional"}
     planned_types = {x["date"]: x.get("type", "unknown") for x in sessions}
     by_type, kilometres, running_sessions = {}, 0, 0
     for log in recorded:
         metrics = log.get("metrics") if isinstance(log.get("metrics"), dict) else {}
-        kind = str(log.get("type") or metrics.get("type") or planned_types.get(str(log["date"])[:10], "unknown"))
+        kind = str(log.get("type") or metrics.get("type") or ("unknown" if log.get("kind") == "additional" else planned_types.get(str(log["date"])[:10], "unknown")))
         by_type[kind] = by_type.get(kind, 0) + 1
         distance = _number(log.get("distance_km", metrics.get("distance_km",
                            metrics.get("run_distance_km"))), minimum=0, maximum=1000)
@@ -668,7 +668,7 @@ def weekly_summary(logs, plan, today=None):
         running_sessions += bool(distance and distance > 0 or kind == "run")
     duration = sum(_number(x.get("duration"), 0, 0, 1440) for x in recorded)
     load = sum(_number(x.get("duration"), 0, 0, 1440) * _number(x.get("rpe"), 0, 0, 10) for x in recorded)
-    missed = {str(x.get("date"))[:10] for x in logs if isinstance(x, dict) and x.get("status") == "missed"
+    missed = {str(x.get("date"))[:10] for x in logs if isinstance(x, dict) and x.get("kind") != "additional" and x.get("status") == "missed"
               and start <= _date(x.get("date"), date.min) <= today}
     return {"start": start.isoformat(), "end": end.isoformat(), "completed": len(recorded),
             "planned": sum(x.get("duration", 0) > 0 for x in sessions),
