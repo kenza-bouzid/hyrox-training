@@ -373,7 +373,124 @@ class CoachTests(unittest.TestCase):
         self.assertIn("2 rounds: 500 m", " ".join(next(x for x in poor if x["date"] == now.isoformat())["main"]))
         logs[-1]["rpe"] = 6
         yellow = coach.generate_plan(self.profile, RACE, logs, {"fatigue": 6}, now)
-        self.assertIn("2 rounds: 500 m", " ".join(next(x for x in yellow if x["date"] == now.isoformat())["main"]))
+        self.assertIn("2 rounds: 400 m", " ".join(next(x for x in yellow if x["date"] == now.isoformat())["main"]))
+
+    def test_precise_doses_across_profiles_and_phases(self):
+        for person in ("Kenza", "Rob", "New athlete"):
+            plan = coach.generate_plan(coach.default_profile(person), RACE, [], {}, self.today)
+            for workout in plan:
+                with self.subTest(person=person, day=workout["date"]):
+                    dose = workout["prescription"]
+                    if dose:
+                        self.assertEqual(workout["main"][:len(coach._dose_lines(dose))],
+                                         coach._dose_lines(dose))
+                        self.assertIn("minutes", workout["warmup"])
+                        self.assertIn("5 minutes", workout["cooldown"])
+                    if dose and dose["kind"] == "hyrox":
+                        self.assertIn(f"running {dose['rounds'] * dose['run']} m", workout["main"][1])
+                        self.assertIn("Rest 2 minutes between rounds", workout["main"][0])
+                        self.assertIn("Rest 60 seconds", workout["main"][2])
+                    if workout["type"] == "class" and not dose:
+                        text = " ".join(workout["main"])
+                        self.assertIn("pending", text)
+                        self.assertIn("sets/reps", text)
+                        self.assertIn("rest", text)
+            technique = " ".join(" ".join(x["main"][:3]) for x in plan
+                                 if x["type"] == "hyrox")
+            for station in ("SkiErg", "sled push", "sled pull", "Row", "farmers carry",
+                            "sandbag lunges", "burpee broad jumps", "wall ball"):
+                self.assertIn(station, technique)
+            self.assertTrue(any(x["phase"] == "taper" and x["prescription"]
+                                for x in plan))
+
+    def test_event_station_order_quantities_and_custom_loads(self):
+        stations = [dict(x) for x in coach.STATIONS]
+        stations[1].update(load=125, distance=40)
+        stations[5].update(load=18, distance=150)
+        plan = coach.generate_plan(self.profile, RACE, [], {}, self.today, stations)
+        for event in (x for x in plan if x["type"] in ("race", "simulation")):
+            legs = [line for line in event["main"] if line.startswith("Leg ")]
+            self.assertEqual(len(legs), 8)
+            for i, (line, spec) in enumerate(zip(legs, stations), 1):
+                self.assertTrue(line.startswith(f"Leg {i}: run 1 km, then {spec['name']}:"))
+                self.assertIn(f"{spec['distance']} {spec['unit']}", line)
+            self.assertIn("125 kg including sled", legs[1])
+            self.assertIn("18 kg each, 2 implements", legs[5])
+            self.assertIn("unverified", " ".join(event["main"]))
+        simulation = next(x for x in plan if x["type"] == "simulation")
+        self.assertIn("replace the ENTIRE", " ".join(simulation["main"]))
+        self.assertIn("scaled=true", " ".join(simulation["main"]))
+
+    def test_readiness_replaces_actual_doses_and_recovery_instructions(self):
+        baseline = coach.generate_plan(self.profile, RACE, [], {}, self.today)
+        yellow = coach.generate_plan(self.profile, RACE, [], {"fatigue": 6}, self.today)
+        self.assertEqual(yellow[0]["prescription"]["run"], 400)
+        self.assertEqual(yellow[0]["prescription"]["erg"], 160)
+        self.assertEqual(yellow[0]["prescription"]["sled"], 8)
+        self.assertEqual(yellow[0]["prescription"]["carry"], 16)
+        self.assertNotIn("2 rounds: 500 m", " ".join(yellow[0]["main"]))
+        self.assertIn("running 800 m", yellow[0]["main"][1])
+        strength = next(x for x in yellow if x["type"] == "strength")
+        self.assertEqual(strength["prescription"]["reps"], 6)
+        self.assertEqual(strength["prescription"]["accessory_reps"], 4)
+        self.assertIn("2 × 6 reps EACH", strength["main"][0])
+        self.assertNotIn("2 × 8", " ".join(strength["main"]))
+        for checkin in ({"pain": 5}, {"fatigue": 6, "soreness": 6}):
+            adjusted = coach.generate_plan(self.profile, RACE, [], checkin, self.today)
+            first = adjusted[0]
+            self.assertNotIn("SkiErg", " ".join(first["main"]))
+            if first["duration"] == 0:
+                self.assertEqual(first["warmup"], "Not required")
+                self.assertEqual(first["cooldown"], "Not required")
+                self.assertIsNone(first["prescription"])
+            else:
+                self.assertEqual(first["prescription"]["minutes"], first["duration"] - 10)
+            for old, new in zip(baseline[7:], adjusted[7:]):
+                self.assertEqual(old, new)
+
+    def test_external_class_effort_matches_taper_and_future_readiness(self):
+        baseline = coach.generate_plan(self.profile, RACE, [], {}, self.today)
+        by_date = {x["date"]: x for x in baseline}
+        for day, intensity, effort in (("2026-11-22", "moderate", "4–5"),
+                                       ("2026-11-29", "easy", "2–3")):
+            with self.subTest(day=day):
+                workout = by_date[day]
+                self.assertEqual(workout["intensity"], intensity)
+                self.assertIn(f"Class effort ceiling RPE {effort}/10", " ".join(workout["main"]))
+                self.assertNotIn("RPE 7/10", " ".join(workout["main"]))
+                self.assertIsNone(workout["prescription"])
+                self.assertIn("instructor structure is unknown", " ".join(workout["main"]))
+        original = by_date["2026-10-11"]
+        self.assertEqual(original["intensity"], "hard")
+        self.assertIn("Class effort ceiling RPE 7/10", " ".join(original["main"]))
+        for checkin in ({"fatigue": 6, "soreness": 6}, {"pain": 5}):
+            adjusted = coach.generate_plan(self.profile, RACE, [], checkin, self.today)
+            workout = next(x for x in adjusted if x["date"] == original["date"])
+            self.assertEqual(workout["intensity"], "moderate")
+            self.assertIn("Class effort ceiling RPE 4–5/10", " ".join(workout["main"]))
+            self.assertNotIn("RPE 7/10", " ".join(workout["main"]))
+            self.assertIsNone(workout["prescription"])
+            self.assertIn("instructor structure is unknown", " ".join(workout["main"]))
+            self.assertEqual(workout["warmup"], original["warmup"])
+            self.assertEqual(workout["cooldown"], original["cooldown"])
+
+    def test_reduced_timed_duration_retains_warmup_and_cooldown(self):
+        for day, original_duration, minutes, duration in (
+                ("2026-10-13", 20, 8, 18), ("2026-11-30", 15, 4, 14)):
+            with self.subTest(day=day):
+                baseline = coach.generate_plan(self.profile, RACE, [], {}, day)
+                original = next(x for x in baseline if x["date"] == day)
+                self.assertEqual(original["duration"], original_duration)
+                adjusted = coach.generate_plan(self.profile, RACE, [], {"fatigue": 6}, day)
+                workout = next(x for x in adjusted if x["date"] == day)
+                self.assertEqual(workout["prescription"]["minutes"], minutes)
+                self.assertEqual(workout["duration"], duration)
+                self.assertEqual(workout["duration"], minutes + 10)
+                self.assertIn(f"{minutes} minutes", workout["main"][0])
+                self.assertEqual(workout["warmup"], original["warmup"])
+                self.assertEqual(workout["cooldown"], original["cooldown"])
+                self.assertIn("5 minutes", workout["warmup"])
+                self.assertIn("5 minutes", workout["cooldown"])
 
     def test_weekly_summary_actual_distance_class_and_strength_counts(self):
         logs = [{"date": "2026-10-14", "status": "completed", "duration": 45, "rpe": 6},

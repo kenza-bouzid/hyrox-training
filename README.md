@@ -181,6 +181,32 @@ preview to anyone with its URL. See GitHub's
 - Data-grounded conversational coaching without an LLM inventing workouts.
 - Installable PWA with cached workout instructions and persistent offline logs.
 
+### Precise workout prescriptions and references
+
+App-programmed sessions specify run metres or minutes, main distance totals for
+intervals, each exercise's sets/reps or metres, effort, rest, and timed warm-up/
+cooldown. Alternating Thursday sessions cover SkiErg/sled push/carries/lunges and
+rowing/sled pull/burpee broad jumps/wall balls; these are scaled technique doses,
+not full race volumes. Progression still requires comfortable recorded training
+and recovery. Readiness reductions replace the actual quantities, not just the
+duration label. Durations are estimates including work and rest, not deadlines.
+
+These are **original, conservative app prescriptions**, not copied commercial
+HYROX programmes. Internet programme/rulebook retrieval was unavailable during
+this update; no external plan or current rule was verified. The full simulation
+and race list all eight runs and configured station quantities/loads in order.
+Existing `STATIONS` defaults are **unverified race references**, not recommended
+novice loads: confirm your division's current
+[official HYROX rulebook](https://hyrox.com/rulebooks/) and equipment before racing.
+Choose pain-free, technically manageable training resistance on your actual sled
+surface; record sled mass, kg per carry implement, ball load and target height.
+Use the explicitly scaled rehearsal instead of a full simulation unless the full
+distances and loads are already safely established; record it as scaled.
+
+External classes remain content-pending until instructor instructions or reviewed
+board-photo text supply exact distances/times, exercises, sets/reps, loads and
+rest. Their attendance estimates do not invent an instructor's workout.
+
 ## Gym mode
 
 Open the application and sign in while online before leaving for the gym.
