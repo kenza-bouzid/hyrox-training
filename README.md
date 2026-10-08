@@ -83,6 +83,27 @@ authentication rejected the browser, not that you need an app account.
    dev-container configuration, pull this branch's changes and run
    **Codespaces: Rebuild Container** from the command palette.
 
+### If the local check reports 000 or connection refused
+
+`000` is curl's indication that it received no HTTP response, not an HTTP status
+from the app. A listed forwarded port does not start a server. From the repository
+root in the **Codespace terminal**, start the server in the foreground:
+
+```sh
+export PUBLIC_URL="https://${CODESPACE_NAME}-8000.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}"
+export ALLOWED_HOSTS="${PUBLIC_URL#https://},localhost:8000,127.0.0.1:8000"
+python3 server.py --host 0.0.0.0 --port 8000
+```
+
+Leave that terminal running. Expect `HYROX Coach listening on 0.0.0.0:8000`.
+In a second terminal, repeat the local curl check; once it returns **200**, open
+port 8000 from **Ports**. This command retains the forwarded HTTPS origin and
+secure cookies, unlike starting with the localhost defaults.
+If the command exits, share the displayed error (without credentials), rather
+than repeatedly reopening the browser. If it reports `Address already in use`,
+do not start another copy: inspect the existing server and repeat the local
+check. This recovery does not delete the database.
+
 Do not make the port public to bypass authentication: that exposes this unfinished
 preview to anyone with its URL. See GitHub's
 [port-forwarding documentation](https://docs.github.com/en/codespaces/developing-in-a-codespace/forwarding-ports-in-your-codespace).
