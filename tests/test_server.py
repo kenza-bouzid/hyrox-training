@@ -1,13 +1,21 @@
 import http.client
+import base64
+import io
 import json
 from datetime import date, timedelta
 from pathlib import Path
 import tempfile
+import subprocess
 import threading
 import unittest
 from unittest.mock import patch
 
 import server
+
+
+PHOTO = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/4gHYSUNDX1BST0ZJTEUAAQEAAAHIAAAAAAQwAABtbnRyUkdCIFhZWiAH4AABAAEAAAAAAABhY3NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAA9tYAAQAAAADTLQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlkZXNjAAAA8AAAACRyWFlaAAABFAAAABRnWFlaAAABKAAAABRiWFlaAAABPAAAABR3dHB0AAABUAAAABRyVFJDAAABZAAAAChnVFJDAAABZAAAAChiVFJDAAABZAAAAChjcHJ0AAABjAAAADxtbHVjAAAAAAAAAAEAAAAMZW5VUwAAAAgAAAAcAHMAUgBHAEJYWVogAAAAAAAAb6IAADj1AAADkFhZWiAAAAAAAABimQAAt4UAABjaWFlaIAAAAAAAACSgAAAPhAAAts9YWVogAAAAAAAA9tYAAQAAAADTLXBhcmEAAAAAAAQAAAACZmYAAPKnAAANWQAAE9AAAApbAAAAAAAAAABtbHVjAAAAAAAAAAEAAAAMZW5VUwAAACAAAAAcAEcAbwBvAGcAbABlACAASQBuAGMALgAgADIAMAAxADb/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAIAAgDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AJUAB//Z"
+)
 
 
 class APITest(unittest.TestCase):
@@ -35,7 +43,7 @@ class APITest(unittest.TestCase):
 
     def setUp(self):
         with server.connect() as db:
-            for table in ("coach_adjustments", "nutrition_logs", "external_activities", "team_strategy",
+            for table in ("workout_photos", "coach_adjustments", "nutrition_logs", "external_activities", "team_strategy",
                           "station_specs", "simulation_results", "readiness_logs", "mutation_keys",
                           "additional_workouts", "workout_completions", "workouts", "training_plans", "reset_tokens",
                           "sessions", "auth_limits", "team_members", "athletes", "races", "users", "teams"):
@@ -54,7 +62,7 @@ class APITest(unittest.TestCase):
         conn.request(method, path, json.dumps(data) if data is not None else None, headers)
         response = conn.getresponse()
         raw = response.read()
-        result = json.loads(raw)
+        result = raw if response.getheader("Content-Type") == "image/jpeg" else json.loads(raw)
         cookie = response.getheader("Set-Cookie")
         if cookie and isinstance(result, dict):
             result["cookie"] = cookie.split(";")[0]
@@ -68,6 +76,135 @@ class APITest(unittest.TestCase):
         })
         self.assertEqual(status, 200, session)
         return session
+
+    def test_board_photos_attach_replace_remove_and_private_retrieval(self):
+        athlete = self.signup()
+        teammate = self.signup("rob@example.test", "Rob", athlete["team"]["invite_code"])
+        payload = {"date": date.today().isoformat(), "client_id": "photo-1", "status": "started",
+                   "photo": PHOTO, "instructions": "4 rounds\n500m row\n20 wall balls"}
+        status, result = self.request("/api/workouts/log", "POST", payload, athlete)
+        self.assertEqual(status, 200, result)
+        photo_id = result["log"]["photo_id"]
+        self.assertNotIn("photo", result["log"])
+        self.assertEqual(self.request("/api/photos/" + photo_id)[0], 401)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=teammate)[0], 404)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=athlete),
+                         (200, base64.b64decode(PHOTO)))
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"]["photo_id"], photo_id)
+        self.assertEqual(self.request("/api/dashboard", session=teammate)[1]["logs"], [])
+        payload.pop("photo")
+        payload.pop("instructions")
+        payload["client_id"] = "legacy-edit"
+        log = self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"]
+        self.assertEqual(log["photo_id"], photo_id)
+        self.assertIn("500m row", log["instructions"])
+        payload.update(client_id="bad-edit", photo="not an image", instructions="updated")
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, athlete)[0], 400)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=athlete)[0], 200)
+        payload.update(client_id="replace-photo", photo=PHOTO)
+        replacement = self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"]["photo_id"]
+        self.assertNotEqual(replacement, photo_id)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=athlete)[0], 404)
+        payload.update(client_id="remove-photo", photo=None)
+        self.assertNotIn("photo_id", self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"])
+        self.assertEqual(self.request("/api/photos/" + replacement, session=athlete)[0], 404)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM workout_photos").fetchone()[0], 0)
+
+    def test_additional_and_external_board_photo_persistence_without_completing_plan(self):
+        athlete = self.signup()
+        day = date.today().isoformat()
+        additional = {"date": day, "kind": "additional", "session_id": "board-extra", "client_id": "extra-photo",
+                      "title": "Class", "type": "class", "status": "started", "photo": PHOTO, "instructions": "Row"}
+        self.assertEqual(self.request("/api/workouts/log", "POST", additional, athlete)[0], 200)
+        external = {"date": day, "title": "Board class", "duration": 45, "intensity": "moderate",
+                    "main": ["4 rounds", "500m row"], "photo": PHOTO}
+        status, result = self.request("/api/workouts/external", "POST", external, athlete)
+        self.assertEqual(status, 200, result)
+        class_photo = result["workout"]["photo_id"]
+        server.initialize()
+        dashboard = self.request("/api/dashboard", session=athlete)[1]
+        self.assertEqual(len(dashboard["logs"]), 1)
+        self.assertEqual(dashboard["logs"][0]["instructions"], "Row")
+        self.assertIn("photo_id", dashboard["logs"][0])
+        self.assertNotIn(PHOTO, json.dumps(dashboard))
+        planned = next(workout for workout in dashboard["plan"] if workout["date"] == day)
+        self.assertEqual(planned["photo_id"], class_photo)
+        self.assertEqual(planned["main"], external["main"])
+        self.assertEqual(dashboard["weekly"]["completed"], 0)
+        teammate = self.signup("rob@example.test", "Rob", athlete["team"]["invite_code"])
+        self.assertEqual(self.request("/api/dashboard", session=teammate)[1]["external_classes"], [])
+        self.assertEqual(self.request("/api/photos/" + class_photo, session=teammate)[0], 404)
+        external.pop("photo")
+        self.assertEqual(self.request("/api/workouts/external", "POST", external, athlete)[1]["workout"]["photo_id"], class_photo)
+        external["photo"] = None
+        self.assertEqual(self.request("/api/workouts/external", "POST", external, athlete)[0], 200)
+        self.assertEqual(self.request("/api/photos/" + class_photo, session=athlete)[0], 404)
+        additional.update(client_id="move-photo", date=(date.today() - timedelta(days=1)).isoformat())
+        additional.pop("photo")
+        self.assertIn("photo_id", self.request("/api/workouts/log", "POST", additional, athlete)[1]["log"])
+
+    def test_board_photo_validation_and_scoped_request_limits(self):
+        athlete = self.signup()
+        payload = {"date": date.today().isoformat(), "client_id": "invalid-photo", "status": "started"}
+        raw = base64.b64decode(PHOTO)
+        frame = raw.index(b"\xff\xc0")
+        oversized_dimensions = bytearray(raw)
+        oversized_dimensions[frame + 7:frame + 9] = (1601).to_bytes(2, "big")
+        invalid = ["<svg/>", base64.b64encode(b"<svg/>").decode(),
+                   base64.b64encode(raw[:-2]).decode(), base64.b64encode(oversized_dimensions).decode(),
+                   base64.b64encode(b"x" * 200001).decode(), base64.b64encode(b"\xff\xd8\xff\xd9").decode()]
+        for photo in invalid:
+            with self.subTest(photo=photo[:30]):
+                self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "photo": photo}, athlete)[0], 400)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "photo": PHOTO}, athlete, csrf=False)[0], 403)
+        self.assertEqual(self.request("/api/readiness", "POST", {"sleep": 8, "padding": "a" * 100001}, athlete)[0], 400)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "photo": PHOTO, "padding": "a" * 100001}, athlete)[0], 200)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "client_id": "huge-request", "padding": "a" * 370001}, athlete)[0], 400)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM workout_photos").fetchone()[0], 1)
+
+    def test_ocr_auth_csrf_review_only_limits_and_unavailable(self):
+        athlete = self.signup()
+        photo = {"photo": PHOTO}
+        with patch.object(server, "extract_board", return_value="4 rounds\n500m row") as engine:
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo)[0], 401)
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete, csrf=False)[0], 403)
+            engine.assert_not_called()
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[1]["text"], "4 rounds\n500m row")
+        self.assertEqual(self.request("/api/dashboard", session=athlete)[1]["logs"], [])
+        with patch.object(server.shutil, "which", return_value=None):
+            status, response = self.request("/api/photos/ocr", "POST", photo, athlete)
+            self.assertEqual(status, 400)
+            self.assertIn("manually", response["error"])
+        with server.OCR_LOCK:
+            server.OCR_ACTIVE.add(athlete["user"]["id"])
+        try:
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[0], 429)
+        finally:
+            server.OCR_ACTIVE.clear()
+        with patch.object(server, "extract_board", return_value="text"):
+            for _ in range(17):
+                self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[0], 200)
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[0], 429)
+
+    def test_ocr_timeout_and_bounded_output(self):
+        image = base64.b64decode(PHOTO)
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tesseract"), patch.object(server.subprocess, "Popen") as spawn:
+            process = spawn.return_value
+            process.stdout = io.BytesIO(b"Row\n" * 3000)
+            process.returncode = 0
+            self.assertEqual(len(server.extract_board(image)), 8000)
+            self.assertFalse(spawn.call_args.kwargs["shell"])
+            self.assertEqual(spawn.call_args.args[0][1:], ["stdin", "stdout", "--psm", "6"])
+            process.stdout = io.BytesIO(b"x" * 16001)
+            with self.assertRaisesRegex(server.Invalid, "limits"):
+                server.extract_board(image)
+            process.kill.assert_called()
+            process.stdout = io.BytesIO(b"")
+            process.wait.side_effect = [subprocess.TimeoutExpired("tesseract", 8), 0]
+            with self.assertRaisesRegex(server.Invalid, "timed out"):
+                server.extract_board(image)
 
     def test_authentication_session_and_csrf(self):
         self.assertEqual(self.request("/api/dashboard")[0], 401)
@@ -380,6 +517,7 @@ class APITest(unittest.TestCase):
         self.assertNotEqual(workout["intensity"], "hard")
         self.assertLessEqual(workout["duration"], 25)
         self.assertNotIn("Maximal efforts", workout["main"])
+        self.assertEqual(dashboard["external_classes"][0]["main"], ["Maximal efforts"])
 
 
 if __name__ == "__main__":

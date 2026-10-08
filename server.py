@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -15,9 +17,13 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import smtplib
 import sqlite3
 import ssl
+import subprocess
+import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -62,11 +68,112 @@ CREATE TABLE IF NOT EXISTS team_strategy(team_id TEXT PRIMARY KEY REFERENCES tea
 CREATE TABLE IF NOT EXISTS external_activities(user_id TEXT NOT NULL REFERENCES users(id), date TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(user_id,date));
 CREATE TABLE IF NOT EXISTS nutrition_logs(user_id TEXT NOT NULL REFERENCES users(id), date TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(user_id,date));
 CREATE TABLE IF NOT EXISTS coach_adjustments(user_id TEXT NOT NULL REFERENCES users(id), date TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(user_id,date));
+CREATE TABLE IF NOT EXISTS workout_photos(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), image BLOB NOT NULL);
 """
+PHOTO_BYTES = 200000
+PHOTO_ROUTES = {"/api/workouts/log", "/api/workouts/external", "/api/photos/ocr"}
+OCR_LOCK = threading.Lock()
+OCR_ACTIVE = set()
 
 
 class Invalid(ValueError):
     pass
+
+
+def photo_bytes(value):
+    """Accept bounded JPEG frames, never arbitrary uploads or caller filenames."""
+    if not isinstance(value, str) or len(value) > 4 * ((PHOTO_BYTES + 2) // 3):
+        raise Invalid("Photo must be a JPEG of at most 200 KB.")
+    try:
+        image = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        raise Invalid("Invalid JPEG photo.") from None
+    if len(image) > PHOTO_BYTES or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+        raise Invalid("Invalid JPEG photo (maximum 200 KB).")
+    offset, frame = 2, False
+    while offset < len(image) - 2:
+        if image[offset] != 255:
+            raise Invalid("Invalid JPEG structure.")
+        while offset < len(image) and image[offset] == 255:
+            offset += 1
+        if offset >= len(image):
+            break
+        marker = image[offset]
+        offset += 1
+        if marker in (0, 0xd8, 0xd9) or 0xd0 <= marker <= 0xd7:
+            raise Invalid("Invalid JPEG marker.")
+        length = int.from_bytes(image[offset:offset + 2], "big")
+        if length < 2 or offset + length > len(image) - 2:
+            raise Invalid("Invalid JPEG segment.")
+        segment = image[offset + 2:offset + length]
+        if marker in (0xc0, 0xc2):
+            if frame or len(segment) < 6:
+                raise Invalid("Invalid JPEG frame.")
+            height, width = int.from_bytes(segment[1:3], "big"), int.from_bytes(segment[3:5], "big")
+            components = segment[5]
+            if segment[0] != 8 or components not in (1, 3) or len(segment) != 6 + 3 * components:
+                raise Invalid("Unsupported JPEG frame.")
+            if not 1 <= width <= 1600 or not 1 <= height <= 1600:
+                raise Invalid("Photo dimensions must be at most 1600 × 1600.")
+            frame = True
+        elif marker in (0xc1, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf):
+            raise Invalid("Unsupported JPEG frame.")
+        if marker == 0xda:
+            if not frame or len(segment) < 4 or not image[offset + length:-2]:
+                raise Invalid("Invalid JPEG scan.")
+            return image
+        offset += length
+    raise Invalid("Photo needs a JPEG frame and scan.")
+
+
+def attachment(db, user_id, data, previous, result):
+    if "instructions" in data:
+        result["instructions"] = text(data["instructions"], "reviewed workout instructions", 8000)
+    elif "instructions" in previous:
+        result["instructions"] = previous["instructions"]
+    old_id = previous.get("photo_id")
+    if "photo" not in data:
+        if old_id:
+            result["photo_id"] = old_id
+        return
+    if data["photo"] is not None:
+        image = photo_bytes(data["photo"])
+        photo_id = secrets.token_hex(16)
+        db.execute("INSERT INTO workout_photos VALUES (?,?,?)", (photo_id, user_id, image))
+        result["photo_id"] = photo_id
+    if old_id:
+        db.execute("DELETE FROM workout_photos WHERE id=? AND user_id=?", (old_id, user_id))
+
+
+def extract_board(image):
+    engine = shutil.which("tesseract")
+    if not engine:
+        raise Invalid("Local OCR is unavailable. Ask the administrator to install Tesseract, or type the board instructions manually. Your photo can still be saved.")
+    # Private unnamed input in the database directory; no user-controlled path or shell.
+    with tempfile.TemporaryFile(dir=DB_PATH.parent) as source:
+        source.write(image)
+        source.seek(0)
+        process = subprocess.Popen([engine, "stdin", "stdout", "--psm", "6"], stdin=source,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, shell=False)
+        output = []
+        def read_output():
+            output.append(process.stdout.read(16001))
+            if len(output[0]) > 16000:
+                process.kill()
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise Invalid("OCR timed out. Try a clearer crop or enter the instructions manually.") from None
+        finally:
+            reader.join()
+            process.stdout.close()
+        if process.returncode or not output or len(output[0]) > 16000:
+            raise Invalid("OCR could not read this photo within its limits. Enter the instructions manually.")
+        return output[0].decode("utf-8", errors="replace").strip()[:8000]
 
 
 @contextmanager
@@ -269,6 +376,7 @@ def dashboard(db, user_id, csrf):
         else:
             accepted.append(day)
     state.update(
+        external_classes=list(external.values()),
         plan=plan, readiness=coach.readiness(logs, checkin),
         projection=coach.projection(race, state["simulations"], logs, checkin),
         analysis=coach.simulation_analysis(race, state["simulations"]),
@@ -302,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
         if SECURE_COOKIE:
             self.send_header("Strict-Transport-Security", "max-age=31536000")
 
@@ -325,13 +433,13 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self.respond(200, session_data(db, user_id, csrf), self.cookie(token))
 
-    def body(self):
+    def body(self, maximum=100000):
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
             raise Invalid("Send JSON request data.")
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 100000:
-                raise Invalid("Request body must be between 1 and 100000 bytes.")
+            if length < 1 or length > maximum:
+                raise Invalid(f"Request body must be between 1 and {maximum} bytes.")
             value = json.loads(self.rfile.read(length), parse_constant=lambda _: (_ for _ in ()).throw(Invalid("Non-finite number.")))
             if not isinstance(value, dict):
                 raise Invalid("Expected a JSON object.")
@@ -352,15 +460,29 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(403, {"error": "Cross-origin requests are not allowed."})
         try:
             with connect() as db:
-                data = self.body() if self.command != "GET" else {}
                 if self.command == "POST" and path in {"/api/signup", "/api/login", "/api/password-reset", "/api/password-reset/confirm"}:
-                    return self.public_api(db, path, data)
+                    return self.public_api(db, path, self.body())
                 auth = self.auth(db)
                 if not auth:
                     return self.respond(401, {"error": "Please log in."})
                 if self.command != "GET" and not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), auth["csrf"]):
                     return self.respond(403, {"error": "Refresh your session before saving."})
+                data = self.body(370000 if path in PHOTO_ROUTES else 100000) if self.command != "GET" else {}
                 if self.command == "GET":
+                    if path.startswith("/api/photos/"):
+                        row = db.execute("SELECT image FROM workout_photos WHERE id=? AND user_id=?",
+                                         (path.removeprefix("/api/photos/"), auth["user_id"])).fetchone()
+                        if not row:
+                            return self.respond(404, {"error": "Photo not found."})
+                        self.send_response(200)
+                        self.headers_common()
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("X-Athlete-ID", auth["user_id"])
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("Content-Length", str(len(row[0])))
+                        self.end_headers()
+                        self.wfile.write(row[0])
+                        return
                     if path == "/api/session":
                         return self.respond(200, session_data(db, auth["user_id"], auth["csrf"]))
                     if path == "/api/dashboard":
@@ -372,6 +494,20 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute("DELETE FROM sessions WHERE token_hash=?", (digest(jar["session"].value),))
                     db.commit()
                     return self.respond(200, {"ok": True}, self.cookie(age=0))
+                if path == "/api/photos/ocr" and self.command == "POST":
+                    user_id = auth["user_id"]
+                    if not limited(db, "ocr:" + user_id, 20):
+                        return self.respond(429, {"error": "OCR limit reached (20 per hour). Enter instructions manually."})
+                    with OCR_LOCK:
+                        if user_id in OCR_ACTIVE or len(OCR_ACTIVE) >= 2:
+                            return self.respond(429, {"error": "OCR is busy. Try again shortly."})
+                        OCR_ACTIVE.add(user_id)
+                    try:
+                        image = photo_bytes(data.get("photo"))
+                        return self.respond(200, {"text": extract_board(image)})
+                    finally:
+                        with OCR_LOCK:
+                            OCR_ACTIVE.discard(user_id)
                 result = self.private_api(db, auth, path, data)
                 db.commit()
                 return self.respond(200, result)
@@ -490,6 +626,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise Invalid("Metrics must be numbers, text, or measured numeric split arrays.")
             log["metrics"] = metrics
+            row = db.execute("SELECT data FROM additional_workouts WHERE user_id=? AND session_id=?", (user_id, session_id)).fetchone() if kind == "additional" else db.execute("SELECT data FROM workout_completions WHERE user_id=? AND date=?", (user_id, day)).fetchone()
+            attachment(db, user_id, data, json.loads(row[0]) if row else {}, log)
             db.execute("INSERT INTO mutation_keys VALUES (?,?)", (user_id, client_id))
             if kind == "additional":
                 db.execute("INSERT INTO additional_workouts VALUES (?,?,?,?) ON CONFLICT(user_id,session_id) DO UPDATE SET date=excluded.date,data=excluded.data", (user_id, session_id, day, encoded(log)))
@@ -628,8 +766,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise Invalid("Invalid class structure.")
             workout = {"date": day, "title": text(data.get("title"), "class title", 150, True), "duration": number(data.get("duration", 60), "duration", 1, 180),
                        "intensity": intensity, "main": [text(v, "class instruction", 1000) for v in main], "type": "external"}
+            row = db.execute("SELECT data FROM external_activities WHERE user_id=? AND date=?", (user_id, day)).fetchone()
+            attachment(db, user_id, data, json.loads(row[0]) if row else {}, workout)
             db.execute("INSERT INTO external_activities VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET data=excluded.data", (user_id, day, encoded(workout)))
-            return {"ok": True}
+            return {"ok": True, "workout": workout}
         if path == "/api/coach" and method == "POST":
             question = text(data.get("question"), "question", 2000, True)
             return coach.coach_reply(question, state["profile"], state["race"], state["logs"], state["checkin"], state["simulations"])

@@ -85,11 +85,12 @@
   async function store(operation, name, value) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(name, operation === 'get' || operation === 'all' ? 'readonly' : 'readwrite');
+      const tx = db.transaction(name, ['get', 'all', 'keys'].includes(operation) ? 'readonly' : 'readwrite');
       const objectStore = tx.objectStore(name);
       let request;
       if (operation === 'get') request = objectStore.get(value);
       if (operation === 'all') request = objectStore.getAll();
+      if (operation === 'keys') request = objectStore.getAllKeys();
       if (operation === 'put') request = objectStore.put(value);
       if (operation === 'delete') request = objectStore.delete(value);
       if (operation === 'clear') request = objectStore.clear();
@@ -107,6 +108,151 @@
   }
   async function cacheDashboard(data) {
     await store('put', 'private', { key: `dashboard:${state.session.user.id}`, value: data, savedAt: new Date().toISOString() });
+    const userId = state.session.user.id;
+    const photos = new Set([...arr(data.logs), ...arr(data.plan), ...arr(data.external_classes)].map(item => item.photo_id).filter(Boolean));
+    for (const key of await store('keys', 'private')) {
+      if (key.startsWith(`photo:${userId}:`) && !photos.has(key.split(':').at(-1))) await store('delete', 'private', key);
+    }
+  }
+  async function rememberPhoto(photoId, photo, userId = state.session?.user.id) {
+    if (!photoId || !photo || String(state.session?.user.id) !== String(userId)) return;
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('private', 'readwrite');
+      const target = tx.objectStore('private');
+      const active = target.get('active_user');
+      active.onsuccess = () => {
+        if (String(active.result?.value) === String(userId) && String(state.session?.user.id) === String(userId)) target.put({ key: `photo:${userId}:${photoId}`, value: photo });
+      };
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(new Error('Photo could not be cached on this device.'));
+      tx.onabort = () => reject(new Error('Photo caching was interrupted.'));
+    });
+  }
+  async function loadPhoto(photoId) {
+    if (!/^[a-f0-9]{32}$/.test(photoId || '')) throw new Error('Photo unavailable.');
+    const userId = state.session.user.id;
+    const cached = await store('get', 'private', `photo:${userId}:${photoId}`).catch(() => null);
+    if (cached?.value) return cached.value;
+    const response = await fetch(`/api/photos/${photoId}`, { credentials: 'same-origin', cache: 'no-store' });
+    if (!response.ok || response.headers.get('X-Athlete-ID') !== String(userId) || response.headers.get('Content-Type') !== 'image/jpeg' || String(state.session?.user.id) !== String(userId)) throw new Error('Connect as the original athlete to view this photo.');
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length > 200000) throw new Error('Photo is too large.');
+    const photo = btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''));
+    await rememberPhoto(photoId, photo, userId).catch(() => {});
+    return photo;
+  }
+  function sourceDimensions(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (bytes[0] === 255 && bytes[1] === 216) {
+      let offset = 2;
+      while (offset + 9 < bytes.length) {
+        if (bytes[offset++] !== 255) break;
+        while (bytes[offset] === 255) offset++;
+        const marker = bytes[offset++];
+        const size = view.getUint16(offset);
+        if (size < 2 || offset + size > bytes.length) break;
+        if ([192, 193, 194].includes(marker)) return [view.getUint16(offset + 5), view.getUint16(offset + 3)];
+        offset += size;
+      }
+    } else if (bytes.length >= 24 && bytes.slice(0, 8).join(',') === '137,80,78,71,13,10,26,10') {
+      return [view.getUint32(16), view.getUint32(20)];
+    } else if (bytes.length >= 30 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') {
+      const kind = String.fromCharCode(...bytes.slice(12, 16));
+      if (kind === 'VP8X') return [1 + bytes[24] + (bytes[25] << 8) + (bytes[26] << 16), 1 + bytes[27] + (bytes[28] << 8) + (bytes[29] << 16)];
+      if (kind === 'VP8 ') return [view.getUint16(26, true) & 16383, view.getUint16(28, true) & 16383];
+      if (kind === 'VP8L' && bytes[20] === 47) return [1 + bytes[21] + ((bytes[22] & 63) << 8), 1 + (bytes[22] >> 6) + (bytes[23] << 2) + ((bytes[24] & 15) << 10)];
+    }
+    throw new Error('Choose a valid JPEG, PNG or WebP image.');
+  }
+  async function normalizePhoto(file) {
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 12000000) throw new Error('Choose a JPEG, PNG or WebP photo under 12 MB.');
+    const [width, height] = sourceDimensions(new Uint8Array(await file.arrayBuffer()));
+    if (!width || !height || width > 12000 || height > 12000 || width * height > 40000000) throw new Error('Photo is too large to process safely (40 megapixels maximum).');
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    try {
+      image.src = url;
+      await image.decode();
+      if (image.naturalWidth * image.naturalHeight > 40000000) throw new Error('Image dimensions exceed the limit.');
+      const canvas = document.createElement('canvas');
+      let scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
+      for (let attempt = 0; attempt < 6; attempt++) {
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const context = canvas.getContext('2d');
+        context.fillStyle = '#fff';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const photo = canvas.toDataURL('image/jpeg', .8).split(',')[1];
+        if (photo.length <= 266668 && atob(photo).length <= 200000) return photo;
+        scale *= .75;
+      }
+      throw new Error('Photo cannot be reduced below 200 KB. Try a crop.');
+    } finally { URL.revokeObjectURL(url); }
+  }
+  function mountPhoto(form, saved = {}, target = 'instructions') {
+    const box = document.createElement('section');
+    box.className = 'photo-field full';
+    box.innerHTML = `<h3>Board photo (optional)</h3><p class="small muted">One private photo. Choose a photo or use your camera. OCR runs only on this server, not in the cloud. Review handwriting, reps and loads carefully; nothing is applied or saved automatically.</p><label>Choose photo<input type="file" accept="image/jpeg,image/png,image/webp" data-photo-file></label><label>Take photo<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" data-photo-file></label><img class="board-preview" alt="Your workout board" hidden><div class="form-actions"><button type="button" class="btn outline" data-photo-remove>Remove photo</button><button type="button" class="btn secondary" data-photo-ocr>Extract board text</button></div><div data-photo-review hidden>${textareaField('ocr_review', 'Review extracted text (not yet applied)')}<button type="button" class="btn outline" data-photo-apply>Apply reviewed text to ${target === 'main' ? 'class' : 'workout'} instructions</button></div><p class="small muted" data-photo-message role="status"></p>`;
+    $('.form-grid', form).append(box);
+    $('[name="ocr_review"]', box).maxLength = 8000;
+    if (target === 'main') $('[name="main"]', form).maxLength = 8000;
+    form.photoChange = saved.photo === null ? null : saved.photo || undefined;
+    let current = saved.photo || null;
+    let version = 0;
+    const preview = photo => {
+      const image = $('img', box);
+      image.hidden = !photo;
+      if (photo) image.src = `data:image/jpeg;base64,${photo}`;
+      else image.removeAttribute('src');
+    };
+    preview(current);
+    if (!current && saved.photo_id && saved.photo !== null) loadPhoto(saved.photo_id).then(photo => { if (form.isConnected && !version) { current = photo; preview(photo); } }).catch(() => { $('[data-photo-message]', box).textContent = 'Saved photo unavailable offline until viewed online. It will be preserved unless replaced or removed.'; });
+    box.addEventListener('change', async event => {
+      if (!event.target.matches('[data-photo-file]') || !event.target.files[0]) return;
+      const ownVersion = ++version;
+      form.photoBusy = true;
+      try {
+        const photo = await normalizePhoto(event.target.files[0]);
+        if (ownVersion !== version || !form.isConnected) return;
+        current = photo; form.photoChange = photo; preview(photo);
+        $('[data-photo-review]', box).hidden = true;
+        $('[data-photo-message]', box).textContent = 'Photo ready. Save the form to attach it.';
+      } catch (error) { errorText(form, error); }
+      finally { if (ownVersion === version) form.photoBusy = false; event.target.value = ''; }
+    });
+    box.addEventListener('click', async event => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      try {
+        if (form.photoBusy) throw new Error('Wait for photo processing to finish.');
+        if (button.hasAttribute('data-photo-remove')) {
+          version++; current = null; form.photoChange = null; preview(null);
+          $('[data-photo-review]', box).hidden = true;
+          $('[data-photo-message]', box).textContent = 'Photo will be removed when you save.';
+        } else if (button.hasAttribute('data-photo-ocr')) {
+          if (!current) throw new Error('Choose a photo, or connect to load the saved photo first.');
+          const ownVersion = version;
+          button.disabled = true;
+          const result = await api('/api/photos/ocr', 'POST', { photo: current });
+          if (!form.isConnected || ownVersion !== version) return;
+          $('[name="ocr_review"]', box).value = result.text;
+          $('[data-photo-review]', box).hidden = false;
+          $('[data-photo-message]', box).textContent = result.text ? 'Check the entire photo: OCR can omit or misread text and is limited to 8000 characters. Correct it, then explicitly apply it. Duration, RPE and status are unchanged.' : 'No text found. Enter instructions manually.';
+        } else if (button.hasAttribute('data-photo-apply')) {
+          const text = $('[name="ocr_review"]', box).value;
+          if (text.length > 8000 || (target === 'main' && (text.split('\n').filter(line => line.trim()).length > 30 || text.split('\n').some(line => line.length > 1000)))) throw new Error('Shorten instructions to 8000 characters (class: 30 lines, 1000 characters per line).');
+          $(`[name="${target}"]`, form).value = text;
+          $('[data-photo-message]', box).textContent = 'Reviewed text applied. Save the form when ready.';
+        }
+      } catch (error) { errorText(form, error); }
+      finally { button.disabled = false; }
+    });
+  }
+  function photoPayload(form) {
+    if (form.photoBusy) throw new Error('Wait for photo processing to finish before saving.');
+    return form.photoChange === undefined ? {} : { photo: form.photoChange };
   }
   async function loadQueue() {
     try {
@@ -221,6 +367,7 @@
           if (!await store('get', 'queue', item.client_id)) continue;
           const result = await api('/api/workouts/log', 'POST', item.payload, session.csrf_token);
           const confirmed = result.log || { ...item.payload, id: item.payload.session_id || `planned:${item.payload.date}` };
+          if (!result.duplicate) await rememberPhoto(confirmed.photo_id, item.payload.photo, userId).catch(() => {});
           state.dashboard = { ...state.dashboard, logs: mergeLog(arr(state.dashboard.logs), confirmed) };
           await cacheDashboard(state.dashboard);
           await store('delete', 'queue', item.client_id);
@@ -249,7 +396,20 @@
   const mergeLog = (saved, log) => [...saved.filter(item => logKey(item) !== logKey(log)), log].sort((a, b) => a.date.localeCompare(b.date) || String(a.session_time || '').localeCompare(String(b.session_time || '')));
   const exercised = log => ['completed', 'modified'].includes(log.status) && num(log.duration) > 0;
   const logs = () => {
-    return state.queue.slice().sort((a, b) => a.created_at.localeCompare(b.created_at)).reduce((saved, item) => mergeLog(saved, { ...item.payload, queued: true, id: item.payload.session_id || `planned:${item.payload.date}` }), arr(state.dashboard?.logs));
+    return state.queue.slice().sort((a, b) => a.created_at.localeCompare(b.created_at)).reduce((saved, item) => {
+      const log = { ...item.payload, queued: true, id: item.payload.session_id || `planned:${item.payload.date}` };
+      const previous = saved.find(record => logKey(record) === logKey(log));
+      // Attachment and instructions are patches; other log fields remain replacements.
+      if (!Object.hasOwn(log, 'instructions') && Object.hasOwn(previous || {}, 'instructions')) log.instructions = previous.instructions;
+      if (!Object.hasOwn(log, 'photo')) {
+        for (const key of ['photo', 'photo_id']) {
+          if (!Object.hasOwn(log, key) && Object.hasOwn(previous || {}, key)) log[key] = previous[key];
+        }
+      } else {
+        delete log.photo_id;
+      }
+      return mergeLog(saved, log);
+    }, arr(state.dashboard?.logs));
   };
   const workoutLog = date => logs().find(log => log.kind !== 'additional' && log.date === date);
   const isCompleted = date => exercised(workoutLog(date) || {});
@@ -331,7 +491,11 @@
   function findWorkout(id) { return id ? workouts().find(workout => String(workout.id) === id || workout.date === id) : currentWorkout(); }
   function renderWorkout(id) {
     const workout = findWorkout(id);
-    return renderPlannedWorkout(id) + (workout ? `<div class="form-actions section"><button class="btn secondary" data-action="additional" data-date="${esc(workout.date)}">Log additional workout</button>${link('progress', 'View all session logs')}</div><p class="small muted">Keep the planned workout separate. Extra sessions count toward your training load.</p>` : '');
+    return renderPlannedWorkout(id) + (workout ? photoRecord(workout) + photoRecord(workoutLog(workout.date) || {}) + `<div class="form-actions section"><button class="btn secondary" data-action="additional" data-date="${esc(workout.date)}">Log additional workout</button>${link('progress', 'View all session logs')}</div><p class="small muted">Keep the planned workout separate. Extra sessions count toward your training load.</p>` : '');
+  }
+  function photoRecord(record) {
+    const photo = record.photo_id && record.photo !== null ? `<button type="button" class="text-button" data-action="view-photo" data-photo="${esc(record.photo_id)}">View private board photo</button>` : record.photo ? '<p class="small muted">Board photo saved locally; open the workout log to view it.</p>' : '';
+    return record.instructions || photo ? `<section class="photo-record section"><h3>Reviewed board / workout instructions</h3>${record.instructions ? `<p class="board-text">${esc(record.instructions)}</p>` : ''}${photo}</section>` : '';
   }
   function renderPlannedWorkout(id) {
     const workout = findWorkout(id);
@@ -362,7 +526,7 @@
   function historyRow(log) {
     const additional = log.kind === 'additional';
     const title = additional ? log.title : workouts().find(workout => workout.date === log.date)?.title || 'Planned workout';
-    return `<article class="history-card"><div class="row between"><h3>${esc(title)}</h3><span class="tag${log.status === 'skipped' ? ' orange' : ''}">${esc(titleCase(log.status))}${log.queued ? ' · QUEUED' : ''}</span></div><p class="small muted">${esc(dateLabel(log.date, { weekday: 'short', day: 'numeric', month: 'short' }))}${log.session_time ? ` · ${esc(log.session_time)}` : ''} · ${additional ? `Additional · ${esc(titleCase(log.type))}` : 'Planned'}</p><div class="metric-values"><span>${esc(log.duration ?? '—')} minutes</span><span>RPE ${esc(log.rpe ?? '—')}/10</span>${Object.entries(log.metrics || {}).map(([key, value]) => `<span>${esc(titleCase(key))}: ${esc(words(value))}</span>`).join('')}</div>${log.notes ? `<p class="small muted section">${esc(log.notes)}</p>` : ''}${additional ? `<button class="text-button" data-action="additional" data-session="${esc(log.session_id)}">Edit additional workout</button>` : ''}</article>`;
+    return `<article class="history-card"><div class="row between"><h3>${esc(title)}</h3><span class="tag${log.status === 'skipped' ? ' orange' : ''}">${esc(titleCase(log.status))}${log.queued ? ' · QUEUED' : ''}</span></div><p class="small muted">${esc(dateLabel(log.date, { weekday: 'short', day: 'numeric', month: 'short' }))}${log.session_time ? ` · ${esc(log.session_time)}` : ''} · ${additional ? `Additional · ${esc(titleCase(log.type))}` : 'Planned'}</p><div class="metric-values"><span>${esc(log.duration ?? '—')} minutes</span><span>RPE ${esc(log.rpe ?? '—')}/10</span>${Object.entries(log.metrics || {}).map(([key, value]) => `<span>${esc(titleCase(key))}: ${esc(words(value))}</span>`).join('')}</div>${log.notes ? `<p class="small muted section">${esc(log.notes)}</p>` : ''}${photoRecord(log)}${additional ? `<button class="text-button" data-action="additional" data-session="${esc(log.session_id)}">Edit additional workout</button>` : `<button class="text-button" data-action="log" data-id="${esc(log.date)}">Edit workout log</button>`}</article>`;
   }
   function renderInsights(value) {
     if (typeof value === 'string') return `<p class="instruction">${esc(value)}</p>`;
@@ -432,6 +596,19 @@
     const modal = $('#modal');
     modal.innerHTML = `<div class="modal-header"><h2 id="modal-title">${esc(title)}</h2><button class="icon-button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div>${content}`;
     if (!modal.open) modal.showModal();
+    const form = $('form', modal);
+    if (form?.id === 'log-form') {
+      const saved = form.dataset.kind === 'additional' ? logs().find(log => log.session_id === form.dataset.session) || {} : workoutLog(form.dataset.date) || {};
+      $('.form-grid', form).insertAdjacentHTML('beforeend', textareaField('instructions', 'Reviewed board / workout instructions', saved.instructions || '', 'Optional: type or apply reviewed board text'));
+      $('[name="instructions"]', form).maxLength = 8000;
+      mountPhoto(form, saved);
+    } else if (form?.id === 'external-form') {
+      mountPhoto(form, arr(state.dashboard.external_classes).find(item => item.date === $('[name="date"]', form).value) || workouts().find(item => item.date === $('[name="date"]', form).value && item.type === 'external') || {}, 'main');
+      $('[name="date"]', form).addEventListener('change', () => {
+        // Open the selected class rather than carrying another date's private attachment.
+        externalModal($('[name="date"]', form).value);
+      });
+    }
   }
   function modalForm(id, content, submit = 'Save', attributes = '') { return `<form id="${esc(id)}" ${attributes}><div class="form-grid">${content}</div><div class="form-actions"><button class="btn" type="submit">${esc(submit)}</button><button class="btn outline" type="button" data-action="close-modal">Cancel</button></div><p class="form-error" role="alert"></p></form>`; }
   function readinessModal() {
@@ -453,7 +630,7 @@
     }).join('') + textareaField('modification', 'If modified, what changed?', saved.modification || '', 'What did you do instead, and why?') + textareaField('notes', 'Session notes', saved.notes || '', 'How did it feel? What should your next session know?') + textareaField('pre_session_food', 'Pre-session food (optional)', saved.pre_session_food || '') + textareaField('glucose_notes', 'Glucose notes (optional)', saved.glucose_notes || '', 'Your observations only. No medication dosing advice.'), 'Save workout', `data-date="${esc(workout.date)}"`)}`);
   }
   function externalModal(date = state.selectedDate) {
-    const existing = workouts().find(item => item.date === date);
+    const existing = arr(state.dashboard.external_classes).find(item => item.date === date) || workouts().find(item => item.date === date);
     showModal('Make room for your class.', `<p class="small muted modal-intro">This replaces your personal planned session on the selected date. Include class instructions, sets, reps and loads so they’re available offline.</p>${modalForm('external-form', field('date', 'Class date', 'date', date || today(), { required: true }) + field('title', 'Class title', 'text', existing?.type === 'external' ? existing.title : '', { required: true, maxlength: 120 }) + field('duration', 'Duration (minutes)', 'number', existing?.type === 'external' ? existing.duration : 45, { required: true, min: 1, max: 180, step: 1 }) + selectField('intensity', 'Intensity', ['easy', 'moderate', 'hard', 'recovery'], existing?.type === 'external' ? existing.intensity : 'moderate') + textareaField('main', 'Class instructions (one step per line)', existing?.type === 'external' ? arr(existing.main).join('\n') : '', '4 sets × 8 reps\nExercise, load and rest instructions', true), 'Save class & update plan')}`);
   }
   function additionalModal(date = today(), sessionId) {
@@ -528,6 +705,13 @@
       else if (action === 'log') logModal(button.dataset.id);
       else if (action === 'additional') additionalModal(button.dataset.date || today(), button.dataset.session);
       else if (action === 'external') externalModal(button.dataset.date);
+      else if (action === 'view-photo') {
+        const userId = state.session.user.id;
+        const photo = await loadPhoto(button.dataset.photo);
+        if (String(state.session?.user.id) !== String(userId)) return;
+        showModal('Your private workout board.', '<img class="board-preview" alt="Your saved workout board"><p class="small muted">Edit the workout log or class to replace or remove this photo.</p>');
+        $('#modal img').src = `data:image/jpeg;base64,${photo}`;
+      }
       else if (action === 'simulation') simulationModal();
       else if (action === 'scenario') scenarioModal();
       else if (action === 'station-settings') stationSettingsModal();
@@ -548,6 +732,7 @@
         await withPrivateLock(async () => {
           const session = await api('/api/session');
           await api('/api/logout', 'POST', {}, session.csrf_token);
+          state.session = null;
           await store('clear', 'private');
           await store('clear', 'queue');
           state.session = null; state.dashboard = null; state.queue = []; state.chat = []; state.syncError = ''; state.offline = false; state.authMode = 'login';
@@ -603,6 +788,7 @@
         const date = additional ? values.date : form.dataset.date;
         if (date > today()) throw new Error('Record this workout on or after its session date, not in advance.');
         const payload = { client_id: uuid(), athlete_id: state.session.user.id, date, status: values.status, duration: Number(values.duration), metrics: {} };
+        Object.assign(payload, photoPayload(form), { instructions: values.instructions || '' });
         if (additional) {
           Object.assign(payload, { kind: 'additional', session_id: form.dataset.session, title: values.title.trim(), type: values.type.trim().toLowerCase() });
           if (!payload.title || !payload.type) throw new Error('Enter a workout title and type.');
@@ -633,7 +819,10 @@
         const data = { name: values.name, date: values.date, plan_start: values.plan_start, target_seconds: parseTime(values.target, 'Target finish time'), simulation_date: values.simulation_date };
         await saveOnline('/api/race', 'PUT', data, 'Race settings saved. Your training plan is refreshed.');
       } else if (form.id === 'external-form') {
-        await saveOnline('/api/workouts/external', 'POST', { date: values.date, title: values.title, duration: Number(values.duration), intensity: values.intensity, main: values.main.split('\n').map(line => line.trim()).filter(Boolean) }, 'Class saved to your plan.');
+        const data = { date: values.date, title: values.title, duration: Number(values.duration), intensity: values.intensity, main: values.main.split('\n').map(line => line.trim()).filter(Boolean), ...photoPayload(form) };
+        const result = await api('/api/workouts/external', 'POST', data);
+        await rememberPhoto(result.workout?.photo_id, data.photo).catch(() => {});
+        await refresh(); $('#modal').close(); render(); notify('Class saved to your plan (not marked complete).');
       } else if (form.id === 'measurement-form') {
         const measured = {};
         ['kenza_time', 'rob_time', 'transition_time'].forEach(key => { if (values[key]) measured[key.replace('_time', '_seconds')] = parseTime(values[key], titleCase(key)); });

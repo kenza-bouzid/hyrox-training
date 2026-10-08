@@ -1,6 +1,6 @@
 'use strict';
 
-const SHELL_CACHE = 'pair-shell-v3';
+const SHELL_CACHE = 'pair-shell-v4';
 const SHELL = ['/', '/static/index.html', '/static/app.js', '/static/style.css', '/static/icon.svg', '/static/manifest.webmanifest'];
 const STATIC_PATHS = new Set(SHELL.filter(path => path !== '/'));
 
@@ -109,6 +109,7 @@ async function replay() {
       const saved = await fetch('/api/workouts/log', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-CSRF-Token': session.csrf_token }, body: JSON.stringify(item.payload) });
       if (!saved.ok) throw new Error(`Sync failed (${saved.status}); queued workout retained.`);
       const result = await saved.json().catch(() => ({}));
+      if (!result.duplicate && result.log?.photo_id && item.payload.photo) await updateIfActive(db, userId, { key: `photo:${userId}:${result.log.photo_id}`, value: item.payload.photo });
       const cached = await store(db, 'private', 'get', `dashboard:${userId}`);
       if (cached?.value) {
         const confirmed = result.log || { ...item.payload, id: item.payload.session_id || `planned:${item.payload.date}` };

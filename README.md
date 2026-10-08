@@ -7,7 +7,8 @@ of future performance. No LLM, external analytics, or paid services are required
 
 ## Run
 
-Requires Python **3.12+**. There are no third-party runtime dependencies.
+Requires Python **3.12+**. No third-party Python/npm runtime dependencies.
+Optional local board-photo OCR uses the system Tesseract executable.
 
 ```sh
 python3 server.py
@@ -34,6 +35,48 @@ save offline and sync with your account, just like planned workout logs.
 They all contribute to training totals, weekly load and readiness, but do not
 replace or mark the scheduled workout complete. **Add / edit class** still
 replaces the planned session; choose an additional workout to keep both.
+
+### Private board photos and local OCR
+
+**Log this workout**, **Log additional workout**, and **Add / edit class** accept
+one optional board photo per log/class. Choose JPEG, PNG or WebP, or use the
+camera option on supported phones. The browser rejects sources over 12 MB,
+12,000 pixels per side or 40 megapixels, strips metadata by re-encoding to JPEG,
+and reduces to at most 1600 pixels per side and 200 KB. Keep the board tightly
+framed for readable text. Replace/remove a photo in the same form and save;
+cancel leaves the stored photo unchanged. Photos are SQLite blobs, never public
+files, and only the originating athlete can retrieve them (not their teammate).
+
+**Extract board text** is optional local OCR on your own server. Review the
+editable text, correct handwriting, reps and loads, then explicitly **Apply
+reviewed text** to instructions and save the form. It does not guess exercises,
+duration or RPE, or change completion status. Adding a class updates the plan,
+not the completion log. Instructions remain editable manually if OCR is absent,
+unreadable, offline or times out. OCR output is limited to 8,000 characters;
+class instructions allow 30 lines of at most 1,000 characters each.
+
+Install the optional system engine **on the server/deployment host**:
+
+```sh
+# Debian / Ubuntu / Codespaces (also install in your deployment image):
+sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
+# macOS:
+brew install tesseract
+```
+
+On Windows, install Tesseract with English language data and add its executable
+directory to the server process's `PATH`. Restart the server after changing
+`PATH`. No Python/npm packages, external OCR APIs, CDNs or photo transfers to
+third parties are used. The server enforces authenticated, CSRF-protected OCR,
+an 8-second timeout, 20 attempts per athlete per hour, and one running request
+per athlete (two globally). Maintain the system engine's security updates.
+
+Workout photos/instructions save in the athlete-scoped offline queue and sync
+with the log. Saved photos are cached privately in IndexedDB when uploaded or
+viewed; a never-viewed photo needs a connection initially. Class creation/edit
+and OCR require a connection. Private API responses bypass service-worker
+caches. Signing out clears private device data, including photos and the queue.
+Back up the database to preserve photos together with workout records.
 
 ## Test in GitHub Codespaces
 
