@@ -1,0 +1,524 @@
+import http.client
+import base64
+import io
+import json
+from datetime import date, timedelta
+from pathlib import Path
+import tempfile
+import subprocess
+import threading
+import unittest
+from unittest.mock import patch
+
+import server
+
+
+PHOTO = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/4gHYSUNDX1BST0ZJTEUAAQEAAAHIAAAAAAQwAABtbnRyUkdCIFhZWiAH4AABAAEAAAAAAABhY3NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAA9tYAAQAAAADTLQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlkZXNjAAAA8AAAACRyWFlaAAABFAAAABRnWFlaAAABKAAAABRiWFlaAAABPAAAABR3dHB0AAABUAAAABRyVFJDAAABZAAAAChnVFJDAAABZAAAAChiVFJDAAABZAAAAChjcHJ0AAABjAAAADxtbHVjAAAAAAAAAAEAAAAMZW5VUwAAAAgAAAAcAHMAUgBHAEJYWVogAAAAAAAAb6IAADj1AAADkFhZWiAAAAAAAABimQAAt4UAABjaWFlaIAAAAAAAACSgAAAPhAAAts9YWVogAAAAAAAA9tYAAQAAAADTLXBhcmEAAAAAAAQAAAACZmYAAPKnAAANWQAAE9AAAApbAAAAAAAAAABtbHVjAAAAAAAAAAEAAAAMZW5VUwAAACAAAAAcAEcAbwBvAGcAbABlACAASQBuAGMALgAgADIAMAAxADb/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAIAAgDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AJUAB//Z"
+)
+
+
+class APITest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.db_patch = patch.object(server, "DB_PATH", Path(cls.temp.name) / "test.sqlite3")
+        cls.db_patch.start()
+        server.initialize()
+        cls.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.host = "127.0.0.1:" + str(cls.httpd.server_port)
+        cls.host_patch = patch.object(server, "ALLOWED_HOSTS", {cls.host})
+        cls.host_patch.start()
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join()
+        cls.host_patch.stop()
+        cls.db_patch.stop()
+        cls.temp.cleanup()
+
+    def setUp(self):
+        with server.connect() as db:
+            for table in ("workout_photos", "coach_adjustments", "nutrition_logs", "external_activities", "team_strategy",
+                          "station_specs", "simulation_results", "readiness_logs", "mutation_keys",
+                          "additional_workouts", "workout_completions", "workouts", "training_plans", "reset_tokens",
+                          "sessions", "auth_limits", "team_members", "athletes", "races", "users", "teams"):
+                db.execute(f"DELETE FROM {table}")
+
+    def request(self, path, method="GET", data=None, session=None, csrf=True, extra=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=10)
+        headers = {"Content-Type": "application/json"}
+        if session:
+            headers["Cookie"] = session["cookie"]
+            if csrf:
+                headers["X-CSRF-Token"] = session["csrf_token"]
+            if path == "/api/workouts/log" and isinstance(data, dict):
+                data = {"athlete_id": session["user"]["id"], **data}
+        headers.update(extra or {})
+        conn.request(method, path, json.dumps(data) if data is not None else None, headers)
+        response = conn.getresponse()
+        raw = response.read()
+        result = raw if response.getheader("Content-Type") == "image/jpeg" else json.loads(raw)
+        cookie = response.getheader("Set-Cookie")
+        if cookie and isinstance(result, dict):
+            result["cookie"] = cookie.split(";")[0]
+        status = response.status
+        conn.close()
+        return status, result
+
+    def signup(self, email="kenza@example.test", person="Kenza", invite=""):
+        status, session = self.request("/api/signup", "POST", {
+            "email": email, "password": "test-only-long-passphrase", "person": person, "invite_code": invite,
+        })
+        self.assertEqual(status, 200, session)
+        return session
+
+    def test_board_photos_attach_replace_remove_and_private_retrieval(self):
+        athlete = self.signup()
+        teammate = self.signup("rob@example.test", "Rob", athlete["team"]["invite_code"])
+        payload = {"date": date.today().isoformat(), "client_id": "photo-1", "status": "started",
+                   "photo": PHOTO, "instructions": "4 rounds\n500m row\n20 wall balls"}
+        status, result = self.request("/api/workouts/log", "POST", payload, athlete)
+        self.assertEqual(status, 200, result)
+        photo_id = result["log"]["photo_id"]
+        self.assertNotIn("photo", result["log"])
+        self.assertEqual(self.request("/api/photos/" + photo_id)[0], 401)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=teammate)[0], 404)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=athlete),
+                         (200, base64.b64decode(PHOTO)))
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"]["photo_id"], photo_id)
+        self.assertEqual(self.request("/api/dashboard", session=teammate)[1]["logs"], [])
+        payload.pop("photo")
+        payload.pop("instructions")
+        payload["client_id"] = "legacy-edit"
+        log = self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"]
+        self.assertEqual(log["photo_id"], photo_id)
+        self.assertIn("500m row", log["instructions"])
+        payload.update(client_id="bad-edit", photo="not an image", instructions="updated")
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, athlete)[0], 400)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=athlete)[0], 200)
+        payload.update(client_id="replace-photo", photo=PHOTO)
+        replacement = self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"]["photo_id"]
+        self.assertNotEqual(replacement, photo_id)
+        self.assertEqual(self.request("/api/photos/" + photo_id, session=athlete)[0], 404)
+        payload.update(client_id="remove-photo", photo=None)
+        self.assertNotIn("photo_id", self.request("/api/workouts/log", "POST", payload, athlete)[1]["log"])
+        self.assertEqual(self.request("/api/photos/" + replacement, session=athlete)[0], 404)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM workout_photos").fetchone()[0], 0)
+
+    def test_additional_and_external_board_photo_persistence_without_completing_plan(self):
+        athlete = self.signup()
+        day = date.today().isoformat()
+        additional = {"date": day, "kind": "additional", "session_id": "board-extra", "client_id": "extra-photo",
+                      "title": "Class", "type": "class", "status": "started", "photo": PHOTO, "instructions": "Row"}
+        self.assertEqual(self.request("/api/workouts/log", "POST", additional, athlete)[0], 200)
+        external = {"date": day, "title": "Board class", "duration": 45, "intensity": "moderate",
+                    "main": ["4 rounds", "500m row"], "photo": PHOTO}
+        status, result = self.request("/api/workouts/external", "POST", external, athlete)
+        self.assertEqual(status, 200, result)
+        class_photo = result["workout"]["photo_id"]
+        server.initialize()
+        dashboard = self.request("/api/dashboard", session=athlete)[1]
+        self.assertEqual(len(dashboard["logs"]), 1)
+        self.assertEqual(dashboard["logs"][0]["instructions"], "Row")
+        self.assertIn("photo_id", dashboard["logs"][0])
+        self.assertNotIn(PHOTO, json.dumps(dashboard))
+        planned = next(workout for workout in dashboard["plan"] if workout["date"] == day)
+        self.assertEqual(planned["photo_id"], class_photo)
+        self.assertEqual(planned["main"], external["main"])
+        self.assertEqual(dashboard["weekly"]["completed"], 0)
+        teammate = self.signup("rob@example.test", "Rob", athlete["team"]["invite_code"])
+        self.assertEqual(self.request("/api/dashboard", session=teammate)[1]["external_classes"], [])
+        self.assertEqual(self.request("/api/photos/" + class_photo, session=teammate)[0], 404)
+        external.pop("photo")
+        self.assertEqual(self.request("/api/workouts/external", "POST", external, athlete)[1]["workout"]["photo_id"], class_photo)
+        external["photo"] = None
+        self.assertEqual(self.request("/api/workouts/external", "POST", external, athlete)[0], 200)
+        self.assertEqual(self.request("/api/photos/" + class_photo, session=athlete)[0], 404)
+        additional.update(client_id="move-photo", date=(date.today() - timedelta(days=1)).isoformat())
+        additional.pop("photo")
+        self.assertIn("photo_id", self.request("/api/workouts/log", "POST", additional, athlete)[1]["log"])
+
+    def test_board_photo_validation_and_scoped_request_limits(self):
+        athlete = self.signup()
+        payload = {"date": date.today().isoformat(), "client_id": "invalid-photo", "status": "started"}
+        raw = base64.b64decode(PHOTO)
+        frame = raw.index(b"\xff\xc0")
+        oversized_dimensions = bytearray(raw)
+        oversized_dimensions[frame + 7:frame + 9] = (1601).to_bytes(2, "big")
+        invalid = ["<svg/>", base64.b64encode(b"<svg/>").decode(),
+                   base64.b64encode(raw[:-2]).decode(), base64.b64encode(oversized_dimensions).decode(),
+                   base64.b64encode(b"x" * 200001).decode(), base64.b64encode(b"\xff\xd8\xff\xd9").decode()]
+        for photo in invalid:
+            with self.subTest(photo=photo[:30]):
+                self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "photo": photo}, athlete)[0], 400)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "photo": PHOTO}, athlete, csrf=False)[0], 403)
+        self.assertEqual(self.request("/api/readiness", "POST", {"sleep": 8, "padding": "a" * 100001}, athlete)[0], 400)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "photo": PHOTO, "padding": "a" * 100001}, athlete)[0], 200)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "client_id": "huge-request", "padding": "a" * 370001}, athlete)[0], 400)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM workout_photos").fetchone()[0], 1)
+
+    def test_ocr_auth_csrf_review_only_limits_and_unavailable(self):
+        athlete = self.signup()
+        photo = {"photo": PHOTO}
+        with patch.object(server, "extract_board", return_value="4 rounds\n500m row") as engine:
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo)[0], 401)
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete, csrf=False)[0], 403)
+            engine.assert_not_called()
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[1]["text"], "4 rounds\n500m row")
+        self.assertEqual(self.request("/api/dashboard", session=athlete)[1]["logs"], [])
+        with patch.object(server.shutil, "which", return_value=None):
+            status, response = self.request("/api/photos/ocr", "POST", photo, athlete)
+            self.assertEqual(status, 400)
+            self.assertIn("manually", response["error"])
+        with server.OCR_LOCK:
+            server.OCR_ACTIVE.add(athlete["user"]["id"])
+        try:
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[0], 429)
+        finally:
+            server.OCR_ACTIVE.clear()
+        with patch.object(server, "extract_board", return_value="text"):
+            for _ in range(17):
+                self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[0], 200)
+            self.assertEqual(self.request("/api/photos/ocr", "POST", photo, athlete)[0], 429)
+
+    def test_ocr_timeout_and_bounded_output(self):
+        image = base64.b64decode(PHOTO)
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tesseract"), patch.object(server.subprocess, "Popen") as spawn:
+            process = spawn.return_value
+            process.stdout = io.BytesIO(b"Row\n" * 3000)
+            process.returncode = 0
+            self.assertEqual(len(server.extract_board(image)), 8000)
+            self.assertFalse(spawn.call_args.kwargs["shell"])
+            self.assertEqual(spawn.call_args.args[0][1:], ["stdin", "stdout", "--psm", "6"])
+            process.stdout = io.BytesIO(b"x" * 16001)
+            with self.assertRaisesRegex(server.Invalid, "limits"):
+                server.extract_board(image)
+            process.kill.assert_called()
+            process.stdout = io.BytesIO(b"")
+            process.wait.side_effect = [subprocess.TimeoutExpired("tesseract", 8), 0]
+            with self.assertRaisesRegex(server.Invalid, "timed out"):
+                server.extract_board(image)
+
+    def test_authentication_session_and_csrf(self):
+        self.assertEqual(self.request("/api/dashboard")[0], 401)
+        session = self.signup()
+        self.assertEqual(self.request("/api/session", session=session)[1]["profile"]["name"], "Kenza")
+        self.assertEqual(self.request("/api/readiness", "POST", {"sleep": 8}, session, csrf=False)[0], 403)
+        self.assertEqual(self.request("/api/readiness", "POST", {"sleep": 8}, session,
+                                      extra={"Origin": "https://untrusted.example"})[0], 403)
+        self.assertEqual(self.request("/api/logout", "POST", {}, session)[0], 200)
+        self.assertEqual(self.request("/api/session", session=session)[0], 401)
+        self.assertEqual(self.request("/api/login", "POST", {"email": "kenza@example.test", "password": "incorrect-password"})[0], 401)
+        self.assertEqual(self.request("/api/login", "POST", {"email": "kenza@example.test", "password": "test-only-long-passphrase"})[0], 200)
+
+    def test_private_team_and_shared_simulations(self):
+        ken = self.signup()
+        rob = self.signup("rob@example.test", "Rob", ken["team"]["invite_code"])
+        outsider = self.signup("other@example.test")
+        self.assertEqual(ken["team"]["id"], rob["team"]["id"])
+        self.assertNotEqual(ken["team"]["id"], outsider["team"]["id"])
+        data = {"date": "2026-09-06", "total_seconds": 4200, "runs": [300], "stations": {"sled_push": 100}, "transitions": [5]}
+        self.assertEqual(self.request("/api/simulations", "POST", data, ken)[0], 200)
+        with server.connect() as db:
+            self.assertEqual(len(server.context(db, rob["user"]["id"], rob["csrf_token"])["simulations"]), 2)
+            self.assertEqual(len(server.context(db, outsider["user"]["id"], outsider["csrf_token"])["simulations"]), 1)
+
+    def test_logging_is_idempotent_persistent_and_athlete_scoped(self):
+        ken = self.signup()
+        rob = self.signup("rob@example.test", "Rob", ken["team"]["invite_code"])
+        self.assertEqual(self.request("/api/workouts/log", "POST", {"athlete_id": ken["user"]["id"],
+            "client_id": "cross-account", "date": "2026-10-07", "status": "started"}, rob)[0], 400)
+        log = {"client_id": "offline-event-1", "date": "2026-10-07", "status": "completed",
+               "duration": 60, "rpe": 7, "sleep": 8, "metrics": {"distance": 5}, "notes": "Intervals"}
+        self.assertEqual(self.request("/api/workouts/log", "POST", log, ken)[0], 200)
+        log["duration"] = 90
+        self.assertTrue(self.request("/api/workouts/log", "POST", log, ken)[1]["duplicate"])
+        with server.connect() as db:
+            state = server.context(db, ken["user"]["id"], ken["csrf_token"])
+            self.assertEqual(state["logs"][0]["duration"], 60)
+            self.assertIsNone(state["logs"][0]["energy"])
+            self.assertEqual(server.context(db, rob["user"]["id"], rob["csrf_token"])["logs"], [])
+        log["client_id"] = "offline-event-2"
+        self.assertEqual(self.request("/api/workouts/log", "POST", log, ken)[0], 200)
+        self.assertTrue(Path(server.DB_PATH).exists())
+
+    def test_password_reset_one_use_and_session_invalidation(self):
+        session = self.signup()
+        with server.connect() as db:
+            token = server.mint_reset(db, "kenza@example.test")
+        status, result = self.request("/api/password-reset/confirm", "POST", {"token": token, "password": "replacement-passphrase"})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(self.request("/api/session", session=session)[0], 401)
+        self.assertEqual(self.request("/api/password-reset/confirm", "POST", {"token": token, "password": "replacement-passphrase"})[0], 400)
+        self.assertEqual(self.request("/api/login", "POST", {"email": "kenza@example.test", "password": "replacement-passphrase"})[0], 200)
+        status, response = self.request("/api/password-reset", "POST", {"email": "absent@example.test"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("token", response)
+
+    def test_additional_sessions_preserve_plan_and_update_by_identity(self):
+        session = self.signup()
+        day = date.today().isoformat()
+        planned = {"client_id": "planned-1", "date": day, "status": "completed",
+                   "duration": 40, "rpe": 5, "notes": "Planned work"}
+        self.assertEqual(self.request("/api/workouts/log", "POST", planned, session)[0], 200)
+        extras = []
+        for i in range(2):
+            payload = {"kind": "additional", "session_id": f"extra-{i}", "client_id": f"create-{i}",
+                       "date": day, "status": "completed", "title": f"Extra session {i}",
+                       "type": "run" if i == 0 else "class", "duration": 20 + i * 10, "rpe": 6,
+                       "session_time": f"{8 + i * 10:02d}:30", "notes": "Second workout"}
+            extras.append(payload)
+            status, result = self.request("/api/workouts/log", "POST", payload, session)
+            self.assertEqual(status, 200, result)
+            self.assertEqual(result["log"]["id"], payload["session_id"])
+            self.assertTrue(self.request("/api/workouts/log", "POST", payload, session)[1]["duplicate"])
+        dashboard = self.request("/api/dashboard", session=session)[1]
+        self.assertEqual(len(dashboard["logs"]), 3)
+        self.assertEqual(dashboard["weekly"]["completed"], 3)
+        self.assertEqual(dashboard["weekly"]["duration"], 90)
+        self.assertEqual(dashboard["weekly"]["load"], 500)
+        self.assertEqual(dashboard["readiness"]["load_7d"], 500)
+        old_extra = dict(extras[0])
+        extras[0].update(client_id="edit-extra", duration=25, title="Updated extra",
+                         date=(date.today() - timedelta(days=1)).isoformat())
+        self.assertEqual(self.request("/api/workouts/log", "POST", extras[0], session)[0], 200)
+        duplicate = self.request("/api/workouts/log", "POST", old_extra, session)[1]
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["log"]["duration"], 25)
+        planned.update(client_id="planned-2", duration=45)
+        self.assertEqual(self.request("/api/workouts/log", "POST", planned, session)[0], 200)
+        with server.connect() as db:
+            logs = server.context(db, session["user"]["id"], session["csrf_token"])["logs"]
+            self.assertEqual(len(logs), 3)
+            self.assertEqual(next(log for log in logs if log["kind"] == "planned")["duration"], 45)
+            extra = next(log for log in logs if log.get("session_id") == "extra-0")
+            self.assertEqual(extra["date"], extras[0]["date"])
+            self.assertEqual(extra["title"], "Updated extra")
+
+    def test_additional_sessions_are_athlete_scoped(self):
+        ken = self.signup()
+        rob = self.signup("rob@example.test", "Rob", ken["team"]["invite_code"])
+        payload = {"kind": "additional", "session_id": "same-session-id", "client_id": "same-mutation",
+                   "date": date.today().isoformat(), "title": "Kenza run", "type": "run",
+                   "status": "completed", "duration": 30, "rpe": 5}
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, ken)[0], 200)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "athlete_id": ken["user"]["id"]}, rob)[0], 400)
+        self.assertEqual(self.request("/api/dashboard", session=rob)[1]["logs"], [])
+        payload.update(title="Rob session", duration=60)
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, rob)[0], 200)
+        self.assertEqual(self.request("/api/dashboard", session=ken)[1]["logs"][0]["duration"], 30)
+        self.assertEqual(self.request("/api/dashboard", session=rob)[1]["logs"][0]["duration"], 60)
+
+    def test_additional_schema_startup_retains_legacy_data(self):
+        session = self.signup()
+        legacy = {"client_id": "legacy", "date": "2026-10-07", "status": "completed", "duration": 40, "rpe": 5}
+        self.assertEqual(self.request("/api/workouts/log", "POST", legacy, session)[0], 200)
+        with server.connect() as db:
+            db.execute("DROP TABLE additional_workouts")
+            old = {"id": "legacy", **legacy}
+            db.execute("UPDATE workout_completions SET data=?", (server.encoded(old),))
+        server.initialize()
+        self.assertEqual(self.request("/api/dashboard", session=session)[1]["logs"], [old])
+        self.assertTrue(self.request("/api/workouts/log", "POST", legacy, session)[1]["duplicate"])
+        extra = {**legacy, "client_id": "new-extra", "kind": "additional", "session_id": "new-session",
+                 "title": "Extra workout", "type": "recovery"}
+        self.assertEqual(self.request("/api/workouts/log", "POST", extra, session)[0], 200)
+        server.initialize()
+        server.initialize()
+        self.assertEqual(len(self.request("/api/dashboard", session=session)[1]["logs"]), 2)
+
+    def test_invalid_additional_input_does_not_reserve_mutation(self):
+        session = self.signup()
+        payload = {"kind": "additional", "session_id": "extra", "client_id": "retry-after-error",
+                   "date": date.today().isoformat(), "title": "Evening run", "type": "run",
+                   "status": "completed", "duration": 30, "rpe": 5}
+        for invalid in ({"kind": "other"}, {"session_id": ""}, {"title": ""}, {"type": ""},
+                        {"date": "2026-02-30"}, {"date": (date.today() + timedelta(days=2)).isoformat()},
+                        {"session_time": "25:00"}, {"duration": 0}, {"rpe": 0}, {"duration": 601},
+                        {"rpe": float("nan")}, {"title": "x" * 151}):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, **invalid}, session)[0], 400)
+        self.assertEqual(self.request("/api/dashboard", session=session)[1]["logs"], [])
+        self.assertEqual(self.request("/api/workouts/log", "POST", payload, session)[0], 200)
+
+    def test_additional_session_date_allows_one_day_timezone_boundary(self):
+        session = self.signup()
+        today = date.today()
+        payload = {"kind": "additional", "session_id": "timezone-extra", "client_id": "timezone-mutation",
+                   "title": "Local morning run", "type": "run", "status": "completed", "duration": 30, "rpe": 5}
+        for days_ahead in (2, 3):
+            with self.subTest(days_ahead=days_ahead):
+                future = (today + timedelta(days=days_ahead)).isoformat()
+                self.assertEqual(self.request("/api/workouts/log", "POST", {**payload, "date": future}, session)[0], 400)
+        tomorrow = (today + timedelta(days=1)).isoformat()
+        status, result = self.request("/api/workouts/log", "POST", {**payload, "date": tomorrow}, session)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["log"]["date"], tomorrow)
+        self.assertEqual(self.request("/api/dashboard", session=session)[1]["logs"][0]["date"], tomorrow)
+
+    def test_invalid_input_and_static_isolation(self):
+        session = self.signup()
+        for rpe in (-1, 11, "seven"):
+            self.assertEqual(self.request("/api/workouts/log", "POST", {"client_id": "bad", "date": "2026-10-07",
+                "status": "completed", "duration": 60, "rpe": rpe}, session)[0], 400)
+        self.assertEqual(self.request("/api/readiness", "POST", {"sleep": float("nan")}, session)[0], 400)
+        self.assertEqual(self.request("/api/simulations", "POST", {"date": "2026-09-06",
+            "total_seconds": 600, "runs": [500, 500]}, session)[0], 400)
+        self.assertEqual(self.request("/api/workouts/log", "POST", {"client_id": "bad", "date": "2026-02-30",
+            "status": "started"}, session)[0], 400)
+        for path in ("/server.py", "/../server.py", "/data/coach.sqlite3"):
+            self.assertEqual(self.request(path)[0], 404)
+        self.assertEqual(self.request("/api/session", session=session, extra={"Host": "attacker.example"})[0], 400)
+
+    def test_signup_duplicates_rollback_and_no_default_accounts(self):
+        session = self.signup()
+        status, _ = self.request("/api/signup", "POST", {"email": "another@example.test",
+            "password": "test-only-long-passphrase", "person": "Kenza", "invite_code": session["team"]["invite_code"]})
+        self.assertEqual(status, 409)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM users").fetchone()[0], 1)
+            self.assertNotIn("test-only", db.execute("SELECT password FROM users").fetchone()[0])
+
+    def test_dashboard_persists_plan_and_configurable_station_loads(self):
+        session = self.signup()
+        status, dashboard = self.request("/api/dashboard", session=session)
+        self.assertEqual(status, 200, dashboard)
+        self.assertEqual(len(dashboard["plan"]), 56)
+        self.assertEqual(len(dashboard["stations"]), 8)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM workouts").fetchone()[0], 56)
+        stations = dashboard["stations"]
+        next(s for s in stations if s["id"] == "sled_push")["load"] = 145
+        self.assertEqual(self.request("/api/stations", "PUT", {"stations": stations}, session)[0], 200)
+        status, changed = self.request("/api/dashboard", session=session)
+        self.assertEqual(status, 200, changed)
+        self.assertEqual(next(s for s in changed["stations"] if s["id"] == "sled_push")["load"], 145)
+
+    def test_external_class_cannot_bypass_pain_modification(self):
+        session = self.signup()
+        start = date.today()
+        race = {"plan_start": start.isoformat(), "simulation_date": (start + timedelta(days=37)).isoformat(),
+                "date": (start + timedelta(days=55)).isoformat()}
+        self.assertEqual(self.request("/api/race", "PUT", race, session)[0], 200)
+        tomorrow = (start + timedelta(days=1)).isoformat()
+        self.assertEqual(self.request("/api/workouts/external", "POST", {
+            "date": tomorrow, "title": "Hard class", "duration": 90, "intensity": "hard", "main": ["Heavy sled intervals"],
+        }, session)[0], 200)
+        self.assertEqual(self.request("/api/readiness", "POST", {"sleep": 8, "pain": 8}, session)[0], 200)
+        status, dashboard = self.request("/api/dashboard", session=session)
+        self.assertEqual(status, 200, dashboard)
+        workout = next(w for w in dashboard["plan"] if w["date"] == tomorrow)
+        self.assertEqual(workout["duration"], 0)
+        self.assertNotEqual(workout["intensity"], "hard")
+        self.assertIn("adjustment", workout)
+        self.assertEqual(self.request("/api/workouts/external", "POST", {
+            "date": race["simulation_date"], "title": "Class", "duration": 60,
+        }, session)[0], 400)
+
+    def test_personal_profile_and_measured_team_scenario(self):
+        ken = self.signup()
+        rob = self.signup("rob@example.test", "Rob", ken["team"]["invite_code"])
+        self.assertEqual(self.request("/api/profile", "PUT", {"goals": "Sustainable sled technique",
+            "fuelling_preferences": "Review my own evening routine"}, ken)[0], 200)
+        self.assertEqual(self.request("/api/session", session=ken)[1]["profile"]["goals"], "Sustainable sled technique")
+        self.assertNotEqual(self.request("/api/session", session=rob)[1]["profile"]["goals"], "Sustainable sled technique")
+        measurements = {"sled_push": {"kenza_seconds": 200, "rob_seconds": 120,
+                                      "kenza_fatigue": 5, "rob_fatigue": 3, "transition_seconds": 4}}
+        status, result = self.request("/api/measurements", "PUT", {"measurements": measurements}, ken)
+        self.assertEqual(status, 200, result)
+        scenario = {"run_pace_seconds": 300, "station_seconds": [100] * 8, "transition_seconds": [10] * 8}
+        status, result = self.request("/api/scenario", "POST", scenario, rob)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["seconds"], 3280)
+        with server.connect() as db:
+            self.assertEqual(server.context(db, rob["user"]["id"], rob["csrf_token"])["measurements"], measurements)
+
+    def test_auth_rate_limit_and_password_length(self):
+        self.assertEqual(self.request("/api/signup", "POST", {"email": "kenza@example.test",
+            "password": "short", "person": "Kenza"})[0], 400)
+        with server.connect() as db:
+            self.assertTrue(server.limited(db, "test-auth-key", maximum=2))
+            self.assertTrue(server.limited(db, "test-auth-key", maximum=2))
+            self.assertFalse(server.limited(db, "test-auth-key", maximum=2))
+
+    def test_static_response_headers_are_fixed_and_service_worker_scope_is_root(self):
+        for path, mime in (("/", "text/html"), ("/static/app.js", "text/javascript"),
+                           ("/static/manifest.webmanifest", "application/manifest+json"),
+                           ("/sw.js", "text/javascript")):
+            conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=10)
+            conn.request("GET", path)
+            response = conn.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), mime + "; charset=utf-8")
+            self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+            if path == "/sw.js":
+                self.assertEqual(response.getheader("Service-Worker-Allowed"), "/")
+            conn.close()
+
+    def test_measured_split_arrays_sync_and_invalid_arrays_do_not(self):
+        session = self.signup()
+        log = {"client_id": "split-event", "date": date.today().isoformat(), "status": "completed",
+               "duration": 40, "rpe": 6, "metrics": {"splits": [240, 245, 238]}}
+        self.assertEqual(self.request("/api/workouts/log", "POST", log, session)[0], 200)
+        with server.connect() as db:
+            self.assertEqual(server.context(db, session["user"]["id"], session["csrf_token"])["logs"][0]["metrics"]["splits"], [240, 245, 238])
+        log.update(client_id="bad-split", metrics={"splits": [{"unexpected": 240}]})
+        self.assertEqual(self.request("/api/workouts/log", "POST", log, session)[0], 400)
+
+    def test_pain_when_skipping_a_session_still_updates_current_readiness(self):
+        session = self.signup()
+        self.assertEqual(self.request("/api/workouts/log", "POST", {"client_id": "pain-skip",
+            "date": date.today().isoformat(), "status": "skipped", "pain": 8}, session)[0], 200)
+        with server.connect() as db:
+            self.assertEqual(server.context(db, session["user"]["id"], session["csrf_token"])["checkin"]["pain"], 8)
+
+    def test_textual_easy_pace_replaces_seeded_numeric_guidance(self):
+        session = self.signup()
+        self.assertEqual(self.request("/api/profile", "PUT", {"easy_pace": "Conversational effort only"}, session)[0], 200)
+        profile = self.request("/api/session", session=session)[1]["profile"]
+        self.assertTrue(profile["easy_pace_override"])
+        self.assertNotIn("easy_pace_seconds", profile)
+        self.assertEqual(profile["benchmark_seconds"], 2645)
+
+    def test_simulation_scaling_flags_survive_persistence(self):
+        session = self.signup()
+        sim = {"date": "2026-09-06", "total_seconds": 3000, "scaled": True,
+               "comparable": False, "full_distance": False, "difficulty": 6}
+        self.assertEqual(self.request("/api/simulations", "POST", sim, session)[0], 200)
+        with server.connect() as db:
+            result = server.context(db, session["user"]["id"], session["csrf_token"])["simulations"][-1]
+            self.assertTrue(result["scaled"])
+            self.assertFalse(result["comparable"])
+            self.assertFalse(result["full_distance"])
+        sim.update(date="2026-09-07", scaled="yes")
+        self.assertEqual(self.request("/api/simulations", "POST", sim, session)[0], 400)
+
+    def test_class_override_preserves_simulation_recovery_without_readiness_warning(self):
+        session = self.signup()
+        start = date.today()
+        simulation = start + timedelta(days=37)
+        self.assertEqual(self.request("/api/race", "PUT", {"plan_start": start.isoformat(),
+            "simulation_date": simulation.isoformat(), "date": (start + timedelta(days=55)).isoformat()}, session)[0], 200)
+        recovery_day = (simulation + timedelta(days=1)).isoformat()
+        self.assertEqual(self.request("/api/workouts/external", "POST", {"date": recovery_day,
+            "title": "High-volume class", "duration": 90, "intensity": "hard", "main": ["Maximal efforts"]}, session)[0], 200)
+        status, dashboard = self.request("/api/dashboard", session=session)
+        self.assertEqual(status, 200, dashboard)
+        workout = next(w for w in dashboard["plan"] if w["date"] == recovery_day)
+        self.assertIn(workout["type"], ("recovery", "class"))
+        self.assertNotEqual(workout["intensity"], "hard")
+        self.assertLessEqual(workout["duration"], 25)
+        self.assertNotIn("Maximal efforts", workout["main"])
+        self.assertEqual(dashboard["external_classes"][0]["main"], ["Maximal efforts"])
+
+
+if __name__ == "__main__":
+    unittest.main()

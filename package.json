@@ -1,0 +1,14 @@
+{
+  "name": "hyrox-training",
+  "version": "1.0.0",
+  "description": "Training plan app for Hyrox Mixed Doubles December 2026",
+  "private": true,
+  "scripts": {
+    "start": "python3 server.py",
+    "test": "python3 -m unittest discover -s tests -v",
+    "test:server": "python3 -m unittest discover -s tests -p test_server.py -v"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED"
+}
